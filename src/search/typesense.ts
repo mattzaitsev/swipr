@@ -19,9 +19,10 @@ export interface ListingDoc {
   region?: string;
   posted_at: number;                 // epoch seconds
   url: string;
-  image?: string;
+  geo_precision?: string;
   seller_kind?: string;
 }
+// No image URLs in the index: Marketplace image URLs expire, so the API reads fresh ones from Postgres per page.
 
 export interface SearchResult {
   found: number;
@@ -43,7 +44,7 @@ const FIELDS = [
   { name: 'region', type: 'string', facet: true, optional: true },
   { name: 'posted_at', type: 'int64', sort: true },
   { name: 'url', type: 'string', index: false, optional: true },
-  { name: 'image', type: 'string', index: false, optional: true },
+  { name: 'geo_precision', type: 'string', index: false, optional: true },
   { name: 'seller_kind', type: 'string', facet: true, optional: true },
 ];
 

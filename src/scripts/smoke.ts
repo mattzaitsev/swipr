@@ -1,12 +1,15 @@
 /**
- * End-to-end check against a running Beta (`npm run dev` in another terminal):
- * health -> saved search -> search + cursors + filters -> listing detail -> saved-search hit arrives.
+ * End-to-end check against a running stack (`docker compose up -d --build`, or `npm run dev`):
+ * health -> saved search -> search + cursors + filters -> listing detail (Marketplace realities) -> image URL ->
+ * saved-search alert. Runs on the host (`npm run smoke`) or in the container
+ * (`docker compose exec app node --import tsx src/scripts/smoke.ts`).
  */
 import { config } from '../config';
 import { runMain, sleep } from '../runtime';
 
 const API = `http://localhost:${config.apiPort}`;
 const AUSTIN = { lat: 30.2672, lng: -97.7431 };
+
 async function get(path: string, init?: RequestInit) {
   const headers: Record<string, string> = { 'x-user-id': 'smoke-user' };
   if (init?.body) headers['content-type'] = 'application/json';
@@ -22,7 +25,7 @@ function check(label: string, ok: boolean, detail = '') {
 async function waitFor<T>(label: string, fn: () => Promise<T | undefined>, timeoutMs = 120_000): Promise<T | undefined> {
   const until = Date.now() + timeoutMs;
   while (Date.now() < until) {
-    const value = await fn();
+    const value = await fn().catch(() => undefined);
     if (value) return value;
     await sleep(3_000);
   }
@@ -30,8 +33,11 @@ async function waitFor<T>(label: string, fn: () => Promise<T | undefined>, timeo
 }
 
 runMain(async () => {
-  const health = await get('/health');
-  check('health', health.ok, JSON.stringify(health));
+  const health = await waitFor('health', async () => {
+    const h = await get('/health');
+    return h.ok ? h : undefined;
+  }, 90_000);
+  if (health) check('health', true, JSON.stringify(health));
 
   // Saved searches match listings that arrive *after* they're created (reverse search on new listings).
   const saved = await get('/saved-searches', {
@@ -44,12 +50,17 @@ runMain(async () => {
     const r = await get(`/search?q=couch&lat=${AUSTIN.lat}&lng=${AUSTIN.lng}&radius_km=30`);
     return r.items.length ? r : undefined;
   });
-  if (first) check('keyword + geo search', first.items.every((i: any) => i.distance_km <= 30), `${first.total} couches within 30 km of Austin`);
+  if (first) {
+    check('keyword + geo search', first.items.every((i: any) => i.distance_km <= 30), `${first.total} couches within 30 km of Austin`);
+    check('fresh image URLs from Postgres', first.items.every((i: any) => typeof i.image === 'string' && i.image.includes('oe=')));
+    const img = await fetch(first.items[0].image);
+    check('image URL loads', img.ok, `${img.status} ${img.headers.get('content-type')}`);
+  }
 
   // Keyset pagination: three pages, no duplicates, newest first.
   const seen: number[] = [];
-  let cursor: string | null = null;
   const posted: string[] = [];
+  let cursor: string | null = null;
   for (let page = 0; page < 3; page++) {
     const r: any = await get(`/search?sort=newest&limit=5${cursor ? `&cursor=${cursor}` : ''}`);
     seen.push(...r.items.map((i: any) => i.id));
@@ -60,14 +71,16 @@ runMain(async () => {
   check('cursor pagination (no duplicates)', new Set(seen).size === seen.length, `${seen.length} items over 3 pages`);
   check('newest-first order', posted.every((p, i) => i === 0 || p <= posted[i - 1]));
 
-  const cheap = await get('/search?sort=price_asc&max_price=300&condition=used&limit=10');
+  const cheap = await get('/search?sort=price_asc&max_price=300&limit=10');
   const prices = cheap.items.map((i: any) => i.price);
   check('price filter + price_asc', prices.every((p: number, i: number) => p <= 300 && (i === 0 || p >= prices[i - 1])), prices.join(', '));
 
   if (first) {
-    const detail = await get(`/listings/${first.items[0].id}`);
-    check('listing detail', detail.images.length > 0 && detail.price_history.length > 0,
-      `${detail.title}, ${detail.images.length} images, ${detail.price_history.length} price points`);
+    const d = await get(`/listings/${first.items[0].id}`);
+    check('listing id kept as string (> 2^53)', typeof d.external_id === 'string' && /^\d{16}$/.test(d.external_id), d.external_id);
+    check('geo precision recorded', ['approximate', 'area'].includes(d.geo_precision), d.geo_precision);
+    check('image expiry recorded', d.images.length > 0 && !!d.images[0].expires_at, d.images[0]?.expires_at);
+    check('price history', d.price_history.length > 0, `${d.price_history.length} point(s)`);
   }
 
   const hits = await waitFor('saved-search hit', async () => {

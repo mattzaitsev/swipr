@@ -4,17 +4,15 @@ import type { ListingDoc } from './typesense';
 
 const DOC_SQL = `
   select l.id, l.source, l.title, l.description, l.price_cents, l.currency, l.condition, l.category, l.status,
-         l.lat, l.lng, l.city, l.region, l.url, s.kind as seller_kind,
-         extract(epoch from coalesce(l.posted_at, l.first_seen_at))::bigint as posted_at,
-         -- EXTENSION POINT: prefer the CDN URL of the mirrored image (storage_key) once a mirror worker exists
-         (select i.source_url from listing_images i where i.listing_id = l.id order by i.position limit 1) as image
+         l.lat, l.lng, l.city, l.region, l.url, l.geo_precision, s.kind as seller_kind,
+         extract(epoch from coalesce(l.posted_at, l.first_seen_at))::bigint as posted_at
   from listings l
   left join sellers s on s.id = l.seller_id`;
 
 interface DocRow {
   id: number; source: string; title: string; description: string | null; price_cents: number; currency: string;
   condition: string; category: string | null; status: string; lat: number | null; lng: number | null;
-  city: string | null; region: string | null; url: string; seller_kind: string | null; posted_at: number; image: string | null;
+  city: string | null; region: string | null; url: string; geo_precision: string | null; seller_kind: string | null; posted_at: number;
 }
 
 export function toDoc(r: DocRow): ListingDoc {
@@ -35,7 +33,7 @@ export function toDoc(r: DocRow): ListingDoc {
   if (r.lat !== null && r.lng !== null) doc.location = [r.lat, r.lng];
   if (r.city) doc.city = r.city;
   if (r.region) doc.region = r.region;
-  if (r.image) doc.image = r.image;
+  if (r.geo_precision) doc.geo_precision = r.geo_precision;
   if (r.seller_kind) doc.seller_kind = r.seller_kind;
   return doc;
 }

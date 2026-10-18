@@ -1,14 +1,15 @@
-# Local infrastructure for the swipr Beta. App processes run on the host with `npm run dev`.
+# swipr local MVP: `docker compose up -d --build` runs everything on this machine.
+# All ports bind to 127.0.0.1 only, so nothing is reachable from your network.
 name: swipr
 
 services:
   postgres:
-    image: postgis/postgis:16-3.4            # Postgres 16 + PostGIS (geo radius matching for saved searches)
+    image: postgis/postgis:16-3.4
     environment:
       POSTGRES_USER: swipr
       POSTGRES_PASSWORD: swipr
       POSTGRES_DB: swipr
-    ports: ["5433:5432"]                     # 5433 on the host so it doesn't clash with a local Postgres
+    ports: ["127.0.0.1:5433:5432"]            # 5433 avoids clashing with a Postgres already on the host
     volumes: [pgdata:/var/lib/postgresql/data]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U swipr -d swipr"]
@@ -17,8 +18,9 @@ services:
       retries: 20
 
   redis:
-    image: redis:7.4-alpine                  # BullMQ ingest queue + alert pub/sub
-    ports: ["6379:6379"]
+    image: redis:7.4-alpine                   # BullMQ schedules, crawl cooldowns, proxy byte budget, alert pub/sub
+    ports: ["127.0.0.1:6379:6379"]
+    volumes: [redisdata:/data]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 3s
@@ -26,11 +28,37 @@ services:
       retries: 20
 
   typesense:
-    image: typesense/typesense:27.1          # search index (keyword + geo + filters)
-    command: ["--data-dir", "/data", "--api-key", "${TYPESENSE_API_KEY:-swipr-dev-key}", "--enable-cors"]
-    ports: ["8108:8108"]
+    image: typesense/typesense:27.1
+    command: ["--data-dir", "/data", "--api-key", "${TYPESENSE_API_KEY:-swipr-dev-key}"]
+    ports: ["127.0.0.1:8108:8108"]
     volumes: [tsdata:/data]
+
+  app:
+    build: .
+    init: true
+    restart: unless-stopped
+    env_file:
+      - path: .env                            # optional overrides (proxy settings, cadence, ...)
+        required: false
+    environment:                              # container networking always wins over .env
+      DATABASE_URL: postgres://swipr:swipr@postgres:5432/swipr
+      REDIS_URL: redis://redis:6379
+      TYPESENSE_URL: http://typesense:8108
+      TYPESENSE_API_KEY: ${TYPESENSE_API_KEY:-swipr-dev-key}
+      BIND_HOST: 0.0.0.0
+    ports:
+      - "127.0.0.1:4200:4200"                 # API
+      - "127.0.0.1:4210:4210"                 # mock marketplace (its image URLs open in your browser)
+    volumes:                                  # edit code on the host, then `docker compose restart app`
+      - ./src:/app/src:ro
+      - ./db:/app/db:ro
+      - ./search.config.json:/app/search.config.json:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      typesense: { condition: service_started }
 
 volumes:
   pgdata: {}
+  redisdata: {}
   tsdata: {}

@@ -1,11 +1,24 @@
-import { demoConnector } from './demo';
+import { config } from '../config';
+import { createMarketplaceConnector } from './marketplace';
 import type { Connector } from './types';
 
+/** The local mock marketplace (src/dev/mock-source.ts): same wire shape as the real connector, zero cost. */
+export const mockConnector = createMarketplaceConnector({
+  source: 'mock',
+  endpoint: `${config.mock.url}/api/graphql/`,
+  docIds: { search: 'mock-search-v1' },
+  listingUrl: (id) => `${config.mock.publicUrl}/marketplace/item/${id}/`,
+  cadence: { newEveryMs: config.mock.newEveryMs, refreshEveryMs: config.mock.refreshEveryMs },
+  maxPages: 4,
+  pageSize: 8,                       // small pages so the incremental stop is visible locally
+  stopAfterKnown: 5,
+});
+
 /**
- * EXTENSION POINT: register real connectors here. Each one implements Connector (tasks/crawl/parse),
- * calls only ctx.gateway.fetch(), and gets its own policy in the gateway keyed by `source`.
+ * ─── EXTENSION POINT: register real connectors here ───
+ * Facebook Marketplace: build `facebookConnector` in ./facebook.ts (checklist there), then add it below.
  */
-export const connectors: Connector[] = [demoConnector];
+export const connectors: Connector[] = [mockConnector];
 
 export function getConnector(source: string): Connector {
   const connector = connectors.find((c) => c.source === source);
@@ -13,4 +26,4 @@ export function getConnector(source: string): Connector {
   return connector;
 }
 
-export type { Connector, CrawlTask, RawItem } from './types';
+export type { Connector, CrawlTask, RawItem, SearchSpec } from './types';

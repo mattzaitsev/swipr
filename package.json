@@ -2,21 +2,24 @@
   "name": "swipr",
   "version": "0.1.0",
   "private": true,
-  "description": "Marketplace aggregator Beta: connectors -> normalizer -> Postgres -> outbox -> Typesense + saved-search alerts",
+  "description": "Marketplace aggregator local MVP: connectors -> gateway -> normalizer -> Postgres/PostGIS -> outbox -> Typesense + saved-search alerts",
   "type": "module",
   "engines": {
     "node": ">=22"
   },
   "scripts": {
-    "up": "docker compose up -d",
+    "up": "docker compose up -d --build",
     "down": "docker compose down",
+    "reset": "docker compose down -v",
+    "logs": "docker compose logs -f app",
+    "infra": "docker compose up -d postgres redis typesense",
+    "dev": "tsx src/dev/all.ts",
     "migrate": "tsx src/scripts/migrate.ts",
     "mock": "tsx src/dev/mock-source.ts",
     "worker": "tsx src/ingest/worker.ts",
     "indexer": "tsx src/search/indexer.ts",
     "matcher": "tsx src/alerts/matcher.ts",
     "api": "tsx src/api/server.ts",
-    "dev": "tsx src/dev/all.ts",
     "reindex": "tsx src/scripts/reindex.ts",
     "smoke": "tsx src/scripts/smoke.ts",
     "typecheck": "tsc --noEmit"
@@ -25,7 +28,8 @@
     "bullmq": "^6.3.17",
     "fastify": "^5.12.7",
     "ioredis": "^6.0.0",
-    "pg": "^8.23.1"
+    "pg": "^8.23.1",
+    "undici": "^8.12.2"
   },
   "devDependencies": {
     "@types/node": "^26.6.5",

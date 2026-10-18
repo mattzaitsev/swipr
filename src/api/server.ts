@@ -24,6 +24,21 @@ function userId(req: FastifyRequest): string {
 
 const httpError = (statusCode: number, message: string) => Object.assign(new Error(message), { statusCode });
 
+/**
+ * Primary image per listing, read fresh from Postgres: Marketplace image URLs are signed and expire, so they are
+ * never indexed. Expired URLs come back as null until a refresh crawl renews them.
+ * EXTENSION POINT: serve mirrored copies (listing_images.storage_key) from your own storage/CDN instead.
+ */
+async function primaryImages(ids: number[]): Promise<Map<number, string>> {
+  if (!ids.length) return new Map();
+  const { rows } = await pool.query<{ listing_id: number; source_url: string }>(
+    `select listing_id, source_url from listing_images
+     where listing_id = any($1) and position = 0 and (expires_at is null or expires_at > now() + interval '5 minutes')`,
+    [ids],
+  );
+  return new Map(rows.map((r) => [r.listing_id, r.source_url]));
+}
+
 export function buildApp() {
   const app = Fastify({ logger: false });
 
@@ -63,6 +78,7 @@ export function buildApp() {
       const { params, sort, page } = buildSearch(input);
       const result = await searchDocs(params);
       const docs = result.hits.map((h) => h.document);
+      const images = await primaryImages(docs.map((d) => d.seq));
       return {
         sort,
         total: input.cursor ? undefined : result.found,      // with a keyset cursor, `found` only counts what's left
@@ -76,13 +92,15 @@ export function buildApp() {
           city: d.city,
           region: d.region,
           source: d.source,
-          image: d.image,
+          image: images.get(d.seq) ?? null,
           url: d.url,
           posted_at: new Date(d.posted_at * 1000).toISOString(),
           distance_km:
             d.location && input.lat !== undefined && input.lng !== undefined
               ? Math.round(distanceKm(d.location, input.lat, input.lng) * 10) / 10
               : undefined,
+          // 'area' = the listing had no coordinates; it's placed at the centre of the search that found it
+          geo_precision: d.geo_precision,
         })),
       };
     },
@@ -96,13 +114,18 @@ export function buildApp() {
       const { rows } = await pool.query(
         `select l.id, l.source, l.external_id, l.url, l.title, l.description, l.price_cents, l.currency, l.condition,
                 l.category, l.status, l.lat, l.lng, l.city, l.region, l.country, l.posted_at, l.first_seen_at,
-                l.last_seen_at, l.cluster_key, s.display_name as seller_name, s.kind as seller_kind
+                l.last_seen_at, l.cluster_key, l.geo_precision, l.original_price_cents,
+                s.display_name as seller_name, s.kind as seller_kind
          from listings l left join sellers s on s.id = l.seller_id where l.id = $1`,
         [req.params.id],
       );
       if (!rows.length) throw httpError(404, 'listing not found');
       const [images, prices] = await Promise.all([
-        pool.query(`select position, source_url as url from listing_images where listing_id = $1 order by position`, [req.params.id]),
+        pool.query(
+          `select position, source_url as url, expires_at, (expires_at is not null and expires_at <= now()) as expired
+           from listing_images where listing_id = $1 order by position`,
+          [req.params.id],
+        ),
         pool.query(`select price_cents, currency, observed_at from price_history where listing_id = $1 order by observed_at`, [req.params.id]),
       ]);
       return { ...rows[0], images: images.rows, price_history: prices.rows };
@@ -191,7 +214,7 @@ export function buildApp() {
 
 export async function start() {
   const app = buildApp();
-  await app.listen({ port: config.apiPort, host: '127.0.0.1' });
+  await app.listen({ port: config.apiPort, host: config.bindHost });
   log(`listening on http://localhost:${config.apiPort}`);
   return () => app.close();
 }

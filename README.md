@@ -1,124 +1,160 @@
-# swipr (Beta)
+# swipr
 
-A marketplace aggregator skeleton. It crawls listings through a fetch gateway, normalizes them into Postgres, projects them into Typesense for search, and alerts saved searches when matching listings appear.
+A marketplace aggregator, built to connect to Facebook Marketplace. It runs as a single-machine local MVP. It crawls location-scoped searches through a fetch gateway, normalizes listings into Postgres/PostGIS, indexes them in Typesense, and alerts saved searches when new matches appear.
 
 ```
-                    ┌──────────────── ingest worker (BullMQ) ────────────────┐
- scheduler ─jobs─►  connector.crawl() ──► gateway.fetch() ──► source        │
-                    │      │ raw items                                      │
-                    │      ▼                                                │
-                    │  normalize(): raw_events, listings, sellers, images,  │
-                    │               price_history + outbox  (one tx)        │
-                    └──────┬─────────────────────────────────────────────────┘
-                           │ outbox (one row per consumer topic)
-             ┌─────────────┴──────────────┐
-             ▼ topic 'search'             ▼ topic 'alerts'
-   indexer ──► Typesense            matcher ──► saved_search_hits ──► Redis pub/sub "swipr:alerts"
-             ▲                                                          (email/push plugs in here)
-   api: /search ─┘   /listings/:id, /saved-searches ──► Postgres
+                     ┌──────────────────────── ingest worker (BullMQ) ─────────────────────────┐
+ schedules ─jobs─►   connector.crawl() ─flow─► gateway (strategy hooks, proxy, pacing) ─► source │
+ (new + refresh)     │      │ raw items                                                         │
+                     │      ▼                                                                   │
+                     │  normalize(): raw_events, listings, sellers, images, price_history       │
+                     │               + outbox  (one transaction)                                │
+                     └──────┬──────────────────────────────────────────────────────────────────┘
+                            │ outbox (one row per consumer topic)
+              ┌─────────────┴──────────────┐
+              ▼ 'search'                   ▼ 'alerts'
+    indexer ──► Typesense           matcher ──► saved_search_hits ──► Redis pub/sub
+              ▲                                                         (email/push later)
+    api: /search ─┘ (+ fresh image URLs from Postgres)    /listings/:id, /saved-searches ──► Postgres
 ```
 
-## Run it locally
+## Local MVP
 
-Prerequisites: Node 22 or newer, and Docker Desktop.
+You need Docker Desktop. Node is optional and only used for the host-side scripts.
 
-```bash
-npm install
-npm run up         # Postgres+PostGIS (host port 5433), Redis (6379), Typesense (8108)
-npm run migrate
-npm run dev        # mock marketplace + ingest worker + indexer + matcher + API, in one terminal
-```
-
-In a second terminal:
-
-```bash
-npm run smoke      # end-to-end check: search, cursors, filters, detail, saved-search alert
-```
-
-The API is at http://localhost:4200. Nothing touches a real site: the demo connector crawls a local fake marketplace (`src/dev/mock-source.ts`, port 4210). The mock posts new listings every 8 seconds, drops prices and marks items sold, so updates, price history and alerts all run on their own.
-
-Each process can also run on its own, which is how you'd deploy them: `npm run api`, `npm run worker`, `npm run indexer`, `npm run matcher`, `npm run mock`.
-
-Settings and defaults are in `.env.example`. Copy it to `.env` to override any of them.
-
-## Where the ingestion gateway plugs in
-
-`src/gateway/index.ts` is the only seam:
-
-- **The interface.** Connectors call `ctx.gateway.fetch(req)` and nothing else. They never see proxies, sessions or health state.
-- **Swapping in the real gateway.** `createGateway()` returns `DirectGateway`, a stand-in that does plain HTTP with a timeout. On a 429 or 403 it throws `RetryLater`. Replace that one line with the real `FetchGateway`.
-- **`RetryLater`.** When the gateway throws it (throttled, blocked or cooling down), the ingest worker stores a per-task "not before" marker in Redis. Scheduled runs skip that task until the marker expires. Nothing fails, and no requests go out during the wait. Run with `MOCK_FAIL_RATE=0.5` to see this.
-- **Per-source policy.** The gateway selects its policy by `GatewayRequest.source`, which is the connector id. A source-specific body check (e.g. throttling reported inside an HTTP 200) belongs in that policy's `classifyBody`, not in the connector.
-
-## Adding a real connector
-
-1. Implement `Connector` (`src/connectors/types.ts`):
-   - `tasks()`: what to poll (query × area).
-   - `crawl()`: page through results with `ctx.gateway.fetch` and yield `{ externalId, payload }` as the source returned it.
-   - `parse()`: a pure mapping from payload to `ListingDraft`.
-2. Register it in `src/connectors/index.ts`.
-3. Give it a policy in the gateway.
-
-`parse()` is kept separate from `crawl()` because raw payloads are stored in `raw_events`. After a parser fix you can re-parse them without refetching.
-
-## Data model (`db/migrations/001_init.sql`)
-
-| Table | Purpose |
+| | Command |
 |---|---|
-| `listings` | One row per `(source, external_id)`. `content_hash` detects real changes. `geog` (PostGIS) and `search_tsv` support alert matching. |
-| `sellers` | Minimal seller identity per source. This is personal data, so keep it lean. |
-| `listing_images` | Source image URLs by position. `content_hash` and `storage_key` are reserved for an image mirror. |
-| `price_history` | A row on first sight and on every price change. |
-| `raw_events` | Each distinct payload stored once, for replay and debugging. |
-| `outbox` | Change events written in the same transaction as the listing, one row per consumer topic. |
-| `saved_searches`, `saved_search_hits` | Alert definitions and their matches. `notified_at` is for delivery. |
+| Start everything (build + run) | `docker compose up -d --build` |
+| Watch logs | `docker compose logs -f app` |
+| Check the pipeline end to end | `docker compose exec app node --import tsx src/scripts/smoke.ts` |
+| Stop (keeps data) | `docker compose down` |
+| Reset (wipes all data) | `docker compose down -v` |
+| Apply code changes | `docker compose restart app` (`src/` is mounted) |
 
-**Dedupe and change detection:**
-- **Re-crawls.** The same payload is stored once in `raw_events`, and an unchanged `content_hash` only bumps `last_seen_at`. A changed hash triggers an update, a price-history row if the price moved, and an outbox event.
-- **Cross-posts.** `cluster_key` (normalized title + price bucket + ~5 km cell) is a crude grouping key. Real dedupe goes there.
+With Node installed, the npm shortcuts are `npm run up | logs | down | reset | smoke`.
+
+- **What runs:** Postgres + PostGIS, Redis, Typesense, and one app container. The app container runs the mock marketplace, the ingest worker, the indexer, the matcher and the API.
+- **Ports:** everything binds to `127.0.0.1` only. The API is http://localhost:4200 and the mock marketplace is http://localhost:4210.
+- **Cost:** none. The only source is a local mock marketplace. It speaks the same wire shape as the real connector and behaves the way Marketplace does: listings appear, prices drop, items sell, image URLs expire, and it can rate-limit.
+- **Running the app on the host instead:** `docker compose up -d postgres redis typesense`, then `npm install && npm run dev`. Stop the `app` container first so the two don't crawl twice.
+
+**What to search** is set in `search.config.json` as queries × areas, where each area is a point, a radius, and a country/region. **Everything else** is in `.env`; copy `.env.example`. Every setting has a default that works locally.
+
+## Adding a residential proxy later (no code changes)
+
+```env
+PROXY_URL=http://gate.your-provider.example:7000
+PROXY_USERNAME=...
+PROXY_PASSWORD=...
+PROXY_USERNAME_TEMPLATE={user}-country-{country}[-region-{region}][-session-{session}-sesstime-{ttl}]
+PROXY_SOURCES=facebook        # only these sources use the proxy; the mock never does
+PROXY_DAILY_MB=200            # hard daily cap on proxied bandwidth
+```
+
+- **Username template.** Copy the exact format from your provider's docs. `[…]` marks optional parts, dropped when a placeholder inside them is empty. That way one template covers both rotating requests (no session) and sticky ones.
+- **Sticky sessions.** These come from connector flows: every page of one search shares a session, so one exit IP serves the whole search. The exit location follows the search area.
+- **Budget.** Proxied bytes are counted per day in Redis. When `PROXY_DAILY_MB` runs out, crawling pauses until midnight UTC.
+
+## Shaped for Facebook Marketplace
+
+| Marketplace reality | How swipr handles it |
+|---|---|
+| Search is a GraphQL POST (`doc_id` + `variables`) with location, radius and cursor pages | `createMarketplaceConnector()` in `src/connectors/marketplace.ts`. The mock speaks the same shape. |
+| You re-crawl the same searches all day | Each search has two schedules. **new** (frequent) sorts newest first and stops after `stopAfterKnown` listings it already has in a row. **refresh** (rare) walks every page to catch price drops and sold items. |
+| Paging should look like one visit | A connector opens a **flow** per search. Its requests share one session (one exit IP when proxied) and the search's geo. |
+| Ids are numeric strings longer than 2^53 | They are stored as text everywhere and never parsed as numbers. |
+| Search results have approximate coordinates, or only a city | `geo_precision` records which: `approximate` when the source gave coordinates, `area` when it falls back to the search area's centre. A fallback never overwrites known coordinates. |
+| Sellers show a struck-through "was" price | `original_price_cents`, alongside our own observed `price_history`. |
+| Image URLs are signed and expire (`oe=`) | `listing_images.expires_at`. The signature is left out of change detection, so a new signature isn't counted as an update. URLs stay out of the search index; the API reads fresh ones from Postgres. |
+| Failures arrive inside HTTP 200 (rate limits, login walls), and `doc_id`s rotate | The connector's `classifyResponse` reads these signals and the gateway acts. Throttled pauses the search. Blocked pauses the whole source. A changed shape fails, alerts once, and pauses the source until a restart. |
+| Sellers are people | Display name and kind only. The crawler never follows sellers to their profiles. |
+
+## Facebook Marketplace: where it plugs in
+
+1. **Connector:** `src/connectors/facebook.ts` holds the intended shape and a checklist: verify field paths against captured responses, keep the `doc_id` in env, add a detail fetch. Then register it in `src/connectors/index.ts`.
+2. **Response signals:** `classifyMarketplace()` in `src/connectors/marketplace.ts`. Confirm it against real throttle and block responses.
+3. **Pacing and cooldowns:** the `facebook` entry in `src/gateway/policies.ts`.
+4. **Recovery:** `src/gateway/http-gateway.ts`, at the "Verdicts" section. The full FetchGateway (health tracking, cooldown → probe → ramp) replaces `HttpGateway` in `createGateway()` (`src/gateway/index.ts`).
+5. **Request strategies:** `src/gateway/strategy.ts`. Register one and select it with `REQUEST_STRATEGY=facebook=<name>`.
+6. **Proxy:** the env vars above. Add `facebook` to `PROXY_SOURCES`; it's already the default.
+7. **Alerts to a human:** the `SourceChanged` handler in `src/ingest/worker.ts`.
+
+Boundaries in the design:
+- Logged-out access to public listings only.
+- No accounts, no CAPTCHA solving, no browser-fingerprint headers.
+- On a block, wait out the cooldown. Identity changes only after proxy-side failures.
+
+## Request strategies
+
+`src/gateway/strategy.ts` defines three hooks per gateway request. The default strategy does nothing, so behaviour is the baseline.
+
+| Hook | When | What a strategy can do |
+|---|---|---|
+| `beforeRequest` | Before every attempt | Add ordinary headers, add delay, choose a sticky or rotating session |
+| `afterResponse` | After the response is classified | Observe it, and slow down the next request to the source |
+| `onRetryableError` | Proxy/network failure or target 5xx | Retry (bounded by `REQUEST_MAX_ATTEMPTS`) or give up. Only proxy-side failures offer `rotateSession` |
+
+**Rules the gateway enforces whatever the strategy does:**
+- A throttled or blocked response always ends in the policy cooldown. Strategies can't retry through it or shorten it.
+- Identity headers (`user-agent`, `sec-ch-ua*`) can never be set by a strategy. There are two supported static ways to set them:
+  - `USER_AGENT` in config, for all sources.
+  - A connector's own headers, once its source is listed in `CONNECTOR_IDENTITY_HEADERS`. The first values seen are pinned for that source until restart, and the worker logs that the override is on.
+
+  Anything else is stripped and reported as `headers.rejected`.
+- Delay can only be added, and it is capped.
+
+**Settings** live in the `RequestStrategySettings` type in `src/config.ts`: session mode, header settings, timing ranges, retry limits and event logging. Each is loaded from env, and the defaults change nothing.
+
+**Events** (`src/gateway/events.ts`) are structured and labelled `origin: baseline | strategy`, with `by: <strategy name>`. They cover requests, sessions, headers (names only), timing, error classification and retries. Set `GATEWAY_EVENTS=log` to print them.
 
 ## API
 
-Saved-search routes need an `x-user-id` header. That's Beta-only auth; see `userId()` in `src/api/server.ts`.
+Saved-search routes need an `x-user-id` header. That's Beta auth; see `userId()` in `src/api/server.ts`.
 
 ```bash
 # keyword + geo + filters (prices in dollars); sort: relevance|newest|price_asc|price_desc|distance
-curl "localhost:4200/search?q=couch&lat=30.2672&lng=-97.7431&radius_km=25&max_price=500&condition=used"
-curl "localhost:4200/search?sort=newest&limit=20&cursor=<next_cursor from the previous page>"
+curl "localhost:4200/search?q=couch&lat=30.2672&lng=-97.7431&radius_km=25&max_price=500"
+curl "localhost:4200/search?sort=newest&limit=20&cursor=<next_cursor>"
 curl "localhost:4200/listings/1"
-
 curl -X POST localhost:4200/saved-searches -H "x-user-id: me" -H "content-type: application/json" \
   -d '{"name":"Cheap couches","query":"couch","lat":30.2672,"lng":-97.7431,"radius_km":25,"max_price":400}'
 curl -H "x-user-id: me" localhost:4200/saved-searches/1/hits
 ```
 
 **Pagination:**
-- `newest`, `price_asc` and `price_desc` use keyset cursors on `(field, seq)`. These stay stable while new listings arrive.
-- `relevance` and `distance` use page cursors, because Typesense can't keyset on score or computed distance.
+- `newest`, `price_asc` and `price_desc` use keyset cursors, which stay stable while new listings arrive.
+- `relevance` and `distance` use page cursors.
 
-**Saved searches** match listings that arrive after the search is created. This is a reverse search on each new listing (`src/alerts/matcher.ts`).
+**Saved searches** match listings that arrive after the search is created.
 
-## Operations
+## Testing failure modes against the mock (zero cost)
 
-- `npm run reindex`: builds `listings_v{n+1}` from Postgres, swaps the `listings` alias to it, and drops the old collection. Searches always go through the alias.
-- The outbox, indexer and matcher are at-least-once and idempotent. The indexer always reads current Postgres state, so replays and reordering are harmless.
-- `npm run down` stops the containers. Add `-v` to `docker compose down` to wipe their data.
-
-## Extension points (marked `EXTENSION POINT` in the code)
-
-| Where | What goes there |
+| Set in `.env`, then `docker compose up -d` | You should see |
 |---|---|
-| `src/gateway/index.ts` | The real FetchGateway |
-| `src/connectors/index.ts` | Real connectors |
-| `src/ingest/worker.ts` | Per-source cadence; retiring schedulers for removed tasks |
-| `src/ingest/normalize.ts` | Real cross-post dedupe; price-drop alerts |
-| `src/search/documents.ts` | Serve mirrored images from your CDN instead of source URLs |
-| `src/outbox.ts` | LISTEN/NOTIFY for lower latency; pruning processed rows |
-| `src/alerts/matcher.ts` | Email/push delivery; batched or geo-sharded matching at scale |
-| `src/api/server.ts` | Real auth |
+| `MOCK_FAIL_RATE=0.5` | "Rate limit exceeded" inside HTTP 200s, and `… paused 30s: mock throttled (in-body)` |
+| `MOCK_ACCEPT_DOC_ID=mock-search-v2` | A rotated doc_id. One `ALERT … response shape changed`, then the source pauses |
+| `MOCK_IMAGE_TTL_MIN=1` | Images expire quickly; refresh crawls renew them |
+| `GATEWAY_EVENTS=log` | Every gateway event, labelled baseline or strategy |
 
-## Known Beta gaps
+## Data model
 
-- **Removal detection.** A listing missing from search results is not proof that it was removed: it may have just fallen past the pages crawled. Marking listings `removed` needs a per-listing refresh (detail fetch) for items whose `last_seen_at` has gone stale. It's deliberately not inferred here.
-- **Images.** Images are referenced at the source, not mirrored. Source image URLs often expire.
-- **No frontend, rate limiting on the API, or real auth yet.**
+`db/migrations/001_init.sql` and `002_marketplace.sql`:
+
+| Table | Purpose |
+|---|---|
+| `listings` | Keyed by `(source, external_id)`. `content_hash` (excluding volatile fields) detects real changes. Also holds `geo_precision` and `original_price_cents`. |
+| `sellers` | Display name and kind only. |
+| `listing_images` | Signed source URLs with `expires_at`. `content_hash`/`storage_key` are reserved for mirroring. |
+| `price_history` | A row on first sight and on every observed price change. |
+| `raw_events` | Each distinct payload stored once, plus the search that found it, for replay and debugging. |
+| `outbox` | Change events, one row per consumer topic, written in the same transaction as the listing. |
+| `saved_searches`, `saved_search_hits` | Alert definitions and matches. |
+
+`npm run reindex` rebuilds the Typesense collection behind the `listings` alias with no downtime.
+
+## Known gaps
+
+- **Removal detection.** A listing missing from search results isn't proof it was removed. Marking listings `removed` needs a detail fetch for listings whose `last_seen_at` has gone stale.
+- **Thin search results.** They carry no description, condition or extra photos; those also come from a detail fetch.
+- **Images.** They aren't mirrored yet: expired ones show as `image: null` until a refresh crawl renews them.
+- **Auth and frontend.** There's no real auth and no frontend yet.
