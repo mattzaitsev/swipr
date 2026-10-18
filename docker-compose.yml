@@ -1,0 +1,36 @@
+# Local infrastructure for the swipr Beta. App processes run on the host with `npm run dev`.
+name: swipr
+
+services:
+  postgres:
+    image: postgis/postgis:16-3.4            # Postgres 16 + PostGIS (geo radius matching for saved searches)
+    environment:
+      POSTGRES_USER: swipr
+      POSTGRES_PASSWORD: swipr
+      POSTGRES_DB: swipr
+    ports: ["5433:5432"]                     # 5433 on the host so it doesn't clash with a local Postgres
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U swipr -d swipr"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7.4-alpine                  # BullMQ ingest queue + alert pub/sub
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  typesense:
+    image: typesense/typesense:27.1          # search index (keyword + geo + filters)
+    command: ["--data-dir", "/data", "--api-key", "${TYPESENSE_API_KEY:-swipr-dev-key}", "--enable-cors"]
+    ports: ["8108:8108"]
+    volumes: [tsdata:/data]
+
+volumes:
+  pgdata: {}
+  tsdata: {}
