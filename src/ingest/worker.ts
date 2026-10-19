@@ -3,6 +3,9 @@
  *   new      (frequent): newest first, stop at listings we already have
  *   refresh  (rare):     all pages, to catch price/status changes and renew expiring image URLs
  * Each run: connector.crawl() --gateway--> source  =>  raw items  =>  normalize()  =>  Postgres + outbox
+ *
+ * The worker makes no request-handling decisions. It carries out the gateway's (RetryLater: pause this search or
+ * the whole source until retryAt) and applies the source policy's changedPauseMs when a response changes shape.
  */
 import { Queue, Worker } from 'bullmq';
 import { config } from '../config';
@@ -11,6 +14,7 @@ import { openFlow, searchId } from '../connectors/flow';
 import { pool } from '../db';
 import { createGateway, RetryLater, SourceChanged } from '../gateway';
 import { logGatewayEvents } from '../gateway/events';
+import { policyFor } from '../gateway/policies';
 import { describeProxy, proxyEnabled } from '../gateway/proxy';
 import { bullConnection, createRedis } from '../redis';
 import { isMain, logger, runMain } from '../runtime';
@@ -19,7 +23,6 @@ import { normalize, type NormalizeResult } from './normalize';
 const log = logger('ingest');
 const deferKey = (t: CrawlTask) => `swipr:defer:${searchId(t)}`;   // shared by both modes: a cooldown pauses the search
 const sourcePauseKey = (source: string) => `swipr:defer:source:${source}`;
-const SOURCE_CHANGED_PAUSE_MS = 30 * 60_000;
 
 async function known(source: string, ids: string[]): Promise<Set<string>> {
   if (!ids.length) return new Set();
@@ -93,8 +96,9 @@ export async function start() {
         // The source changed shape (e.g. rotated doc_id): retrying won't help. Fail this job, pause the whole source,
         // and alert once. EXTENSION POINT (Marketplace recovery): page a human here (Slack/email).
         if (err instanceof SourceChanged) {
-          const first = await redis.set(`${sourcePauseKey(task.source)}:changed`, err.message, 'PX', SOURCE_CHANGED_PAUSE_MS, 'NX');
-          if (first) log(`ALERT ${err.message}. Pausing all ${task.source} searches for 30 min (or until restart).`);
+          const pauseMs = policyFor(task.source).changedPauseMs;
+          const first = await redis.set(`${sourcePauseKey(task.source)}:changed`, err.message, 'PX', pauseMs, 'NX');
+          if (first) log(`ALERT ${err.message}. Pausing all ${task.source} searches for ${Math.round(pauseMs / 60_000)} min (or until restart).`);
         }
         throw err;
       }

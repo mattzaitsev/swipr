@@ -1,22 +1,23 @@
 /**
- * Request strategies: pluggable behavior at three points of every gateway request.
+ * Request strategies: the replaceable decision layer of the gateway. Connectors only declare what they need
+ * (URL, geo, session affinity, headers); every request-handling decision is made here, through four hooks:
  *
- *   beforeRequest   -> may add ordinary headers, add delay, pick sticky/rotating session (incl. on retries)
- *   afterResponse   -> observes the classified response; may slow down the *next* request to this source
- *   onRetryableError-> decides retry vs give up for proxy-side failures, network errors and target 5xx
+ *   beforeRequest    -> headers, delay, sticky/rotating session, pacing/concurrency for the source
+ *   afterResponse    -> observe the classified response; adjust pacing/concurrency for later requests
+ *   onVerdict        -> a throttle or block: choose cooldown length and scope (at or above the floor), slow the source
+ *   onRetryableError -> proxy/network failure or target 5xx: retry (bounded) or give up; rotate session (proxy-side only)
  *
- * Boundaries the gateway enforces, whatever a strategy does:
- *  - Throttled / blocked responses never reach onRetryableError: they always end in the policy cooldown
- *    (RetryLater). Strategies observe them in afterResponse; they can't retry through them or shorten them.
- *  - Identity controls (session rotation) are handed out only for proxy-side failures, never for target signals.
- *  - Strategies can't set identity headers (user-agent, sec-ch-ua*), with or without any opt-in. The supported
- *    paths are static: USER_AGENT in config, or a connector's headers for sources listed in
- *    CONNECTOR_IDENTITY_HEADERS (pinned per source). See IDENTITY_HEADERS in http-gateway.ts.
- *  - Delay can only be added (capped by config), and attempts never exceed requestStrategy.retry.maxAttempts.
+ * Recovery levers are primitives (SourceControls below), so a strategy composes its own policy from them instead of
+ * picking from fixed behaviors. The same primitives are public on the gateway (GatewayControls) for ops tooling.
+ * Swapping a strategy never touches connectors, the normalizer, outbox, indexer or API: register it here and select
+ * it with REQUEST_STRATEGY=<source>=<name>.
+ *
+ * The three non-configurable rules (identity headers, cooldown floor, identity changes) live in guardrails.ts.
  */
 import type { RequestStrategySettings } from '../config';
-import type { GatewayRequest } from './index';
 import type { Side, Verdict } from './events';
+import type { CooldownPlan, CooldownScope } from './guardrails';
+import type { GatewayRequest } from './index';
 import type { SourcePolicy } from './policies';
 
 /** Read-only view of the request being made. */
@@ -35,6 +36,7 @@ export interface ResponseInfo {
   verdict: Verdict;
   ms: number;
   bytes: number;
+  retryAfterMs?: number;
 }
 
 export interface Failure {
@@ -45,45 +47,65 @@ export interface Failure {
 
 export type RetryDecision = { action: 'retry'; delayMs: number; reason: string } | { action: 'give_up' };
 
-interface NoteActions {
+/**
+ * Recovery primitives, implemented by the gateway. Public on the gateway for ops tooling (with an explicit `by`);
+ * strategies get them pre-bound to the request's source via SourceControls.
+ */
+export interface GatewayControls {
+  /** Minimum gap between requests to a source. Clamped to >= policy.minIntervalMs. Returns the effective value. */
+  setMinInterval(source: string, ms: number, reason: string, by?: string): number;
+  /** Cap in-flight requests to a source. Clamped to 1..policy.maxConcurrency. Returns the effective value. */
+  setConcurrency(source: string, limit: number, reason: string, by?: string): number;
+  /** One-shot extra delay before the next request to a source (capped by settings.timing.maxStrategyDelayMs). */
+  delayNext(source: string, ms: number, reason: string, by?: string): number;
+}
+
+/** Primitives bound to the current request's source; available in every hook. */
+export interface SourceControls {
+  setMinInterval(ms: number, reason: string): number;
+  setConcurrency(limit: number, reason: string): number;
+  delayNext(ms: number, reason: string): number;
   /** Emit a strategy.note event (labels show up in GATEWAY_EVENTS=log and any metrics subscriber). */
   note(name: string, labels?: Record<string, string | number>): void;
 }
 
-export interface BeforeActions extends NoteActions {
-  /** Add an ordinary header. Identity headers (user-agent, sec-ch-ua*) are always rejected and reported (headers.rejected). */
+export interface BeforeActions extends SourceControls {
+  /** Add an ordinary header. Identity headers are rejected (guardrail 1) and reported. */
   setHeader(name: string, value: string, reason: string): void;
-  /** Wait this much longer before sending (added on top of policy pacing; capped by settings.timing.maxStrategyDelayMs). */
+  /** Wait this much longer before this request (capped by settings.timing.maxStrategyDelayMs). */
   addDelay(ms: number, reason: string): void;
   /** Sticky = keep the flow's exit IP; rotating = new exit IP per request. */
   useSessionMode(mode: 'sticky' | 'rotating', reason: string): void;
 }
 
-export interface AfterActions extends NoteActions {
-  /** Delay the next request to this source by `ms` (one-shot, capped). Slowing down is the only lever here. */
-  slowDownNext(ms: number, reason: string): void;
+export type AfterActions = SourceControls;
+
+export interface VerdictActions extends SourceControls {
+  /** Set this cooldown's length and scope. The gateway applies the floor (guardrail 2) and reports clamping. */
+  cooldown(ms: number, scope: CooldownScope, reason: string): void;
 }
 
-export interface ProxyFailureActions extends NoteActions {
-  /** Move this flow to a fresh proxy session (new exit IP). Only offered for proxy-side failures. */
-  rotateSession(reason: string): void;
+export interface FailureActions extends SourceControls {
+  /** Present only for proxy-side failures (guardrail 3): move this flow to a fresh proxy session. */
+  rotateSession?(reason: string): void;
 }
 
 export interface RequestStrategy {
   readonly name: string;
   beforeRequest?(ctx: RequestContext, act: BeforeActions): void | Promise<void>;
   afterResponse?(ctx: RequestContext, res: ResponseInfo, act: AfterActions): void | Promise<void>;
-  /** `act` includes rotateSession only when failure.side === 'proxy'. */
-  onRetryableError?(ctx: RequestContext, failure: Failure, act: NoteActions | ProxyFailureActions): RetryDecision | Promise<RetryDecision>;
+  /** Throttled/blocked. `proposed` is the floor; call act.cooldown() to lengthen or widen it. */
+  onVerdict?(ctx: RequestContext, res: ResponseInfo, proposed: Readonly<CooldownPlan>, act: VerdictActions): void | Promise<void>;
+  onRetryableError?(ctx: RequestContext, failure: Failure, act: FailureActions): RetryDecision | Promise<RetryDecision>;
 }
 
 /**
- * Default: no hooks act, so behavior is exactly the baseline (no retries, no extra delay, no extra headers).
- * EXTENSION POINT: write new strategies next to this one and register them below; pick per source with
- * REQUEST_STRATEGY=facebook=<name>. Natural places for later logic:
+ * Default: no hook acts, so behavior is the baseline (no retries, no extra delay or headers, floor cooldowns).
+ * EXTENSION POINT: write new strategies next to this one and register them below. Natural places for later logic:
  *  - beforeRequest: per-flow session preference (e.g. rotating for one-off detail fetches), accept-language
- *    matching the search area, extra politeness delay from settings.timing.extraDelayMs.
- *  - afterResponse: slow down a source when latency climbs or partial GraphQL errors appear.
+ *    matching the search area, politeness delay from settings.timing.extraDelayMs.
+ *  - afterResponse: setMinInterval/setConcurrency from latency trends or partial GraphQL errors.
+ *  - onVerdict: escalating cooldowns for repeat throttles, widening to the whole source, halving concurrency.
  *  - onRetryableError: retry proxy timeouts once on a fresh session; retry 5xx with backoff.
  */
 export const defaultStrategy: RequestStrategy = {
@@ -91,20 +113,29 @@ export const defaultStrategy: RequestStrategy = {
   onRetryableError: () => ({ action: 'give_up' }),
 };
 
-/** Example of a small strategy built on the hooks (registered, not enabled by default). */
+/** Example: retry a proxy-side failure once on a fresh session (registered, not enabled by default). */
 export const retryProxyFailuresOnce: RequestStrategy = {
   name: 'retry-proxy-once',
   onRetryableError(ctx, failure, act) {
     if (failure.side !== 'proxy' || ctx.attempt > 0) return { action: 'give_up' };
-    if ('rotateSession' in act) act.rotateSession(`${failure.kind} on attempt ${ctx.attempt}`);
+    act.rotateSession?.(`${failure.kind} on attempt ${ctx.attempt}`);
     return { action: 'retry', delayMs: ctx.settings.retry.baseDelayMs, reason: failure.kind };
   },
 };
 
-const registry = new Map<string, RequestStrategy>([
-  [defaultStrategy.name, defaultStrategy],
-  [retryProxyFailuresOnce.name, retryProxyFailuresOnce],
-]);
+/** Example: on a throttle, double the cooldown and halve concurrency (registered, not enabled by default). */
+export const conservativeBackoff: RequestStrategy = {
+  name: 'conservative-backoff',
+  onVerdict(_ctx, res, proposed, act) {
+    if (res.verdict !== 'throttled') return;
+    act.cooldown(proposed.ms * 2, proposed.scope, 'double the throttle cooldown');
+    act.setConcurrency(1, 'throttled: one request at a time');
+  },
+};
+
+const registry = new Map<string, RequestStrategy>(
+  [defaultStrategy, retryProxyFailuresOnce, conservativeBackoff].map((s) => [s.name, s]),
+);
 
 export function registerStrategy(strategy: RequestStrategy): void {
   registry.set(strategy.name, strategy);

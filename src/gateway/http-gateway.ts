@@ -1,10 +1,12 @@
 /**
- * Beta gateway: direct or proxied HTTP (per source), per-source pacing, cooldowns from response verdicts,
- * a daily byte budget for proxied traffic, and request-strategy hooks with structured events.
+ * Beta gateway: direct or proxied HTTP (per source), pacing and concurrency per source, cooldowns from response
+ * verdicts, a daily byte budget for proxied traffic, and the request-strategy layer with structured events.
  *
- * Per attempt:  baseline plan -> [beforeRequest] -> pace + send -> classify -> [afterResponse] -> verdict handling
+ * Per attempt:  baseline plan -> [beforeRequest] -> concurrency slot + pacing -> send -> classify -> [afterResponse]
+ *               throttled/blocked -> [onVerdict] -> cooldown (>= floor)        changed -> SourceChanged
  *               transport error or 5xx -> [onRetryableError] -> retry (bounded) or the baseline outcome
  * With the default strategy every hook is inert, so behavior is the baseline.
+ * Rules that strategies can't change are in guardrails.ts; each application emits `guardrail.applied`.
  */
 import type { Redis } from 'ioredis';
 import { fetch } from 'undici';
@@ -12,37 +14,67 @@ import { config } from '../config';
 import { sleep } from '../runtime';
 import { RetryLater, SourceChanged } from './errors';
 import { gatewayEvents, type EventInput, type Side, type Verdict } from './events';
+import { applyCooldownFloor, IDENTITY_HEADERS, identityChangeAllowed, type CooldownPlan } from './guardrails';
 import type { Gateway, GatewayRequest, GatewayResponse } from './index';
-import { policyFor } from './policies';
+import { policyFor, type SourcePolicy } from './policies';
 import { proxyAgentFor, proxyEnabled, rotateSession, sessionIdFor } from './proxy';
-import { strategyFor, type Failure, type RequestContext, type RequestStrategy, type RetryDecision } from './strategy';
+import {
+  strategyFor, type Failure, type FailureActions, type GatewayControls, type RequestContext, type RequestStrategy,
+  type RetryDecision, type SourceControls,
+} from './strategy';
 
 const REQUEST_OVERHEAD_BYTES = 2_048;                    // rough headers + TLS share; providers bill both directions
-/**
- * Identity headers: what a site uses to tell which browser is calling. Supported ways to set them:
- *  1. USER_AGENT in config (all sources), or
- *  2. a connector's requestHeaders()/flow headers, for sources listed in CONNECTOR_IDENTITY_HEADERS (pinned per source).
- * Anything else (an unlisted connector, any strategy) is stripped and reported as headers.rejected.
- */
-const IDENTITY_HEADERS = /^(user-agent|sec-ch-ua(-.*)?)$/i;
-
 const BASELINE = { by: 'baseline', origin: 'baseline' } as const;
+type Emit = (e: EventInput) => void;
+const emitFor = (source: string, flow?: string): Emit => (e) =>
+  gatewayEvents.emit({ ...e, source, flow } as Parameters<typeof gatewayEvents.emit>[0]);
 
-export class HttpGateway implements Gateway {
-  private nextSlot = new Map<string, number>();         // pacing per source
-  private slowNext = new Map<string, number>();         // one-shot slowdowns requested in afterResponse
+export class HttpGateway implements Gateway, GatewayControls {
+  private nextSlot = new Map<string, number>();         // pacing: earliest next send per source
+  private minInterval = new Map<string, number>();      // pacing overrides (>= policy floor)
+  private oneShotDelay = new Map<string, number>();     // delayNext()
+  private concurrency = new Map<string, number>();      // in-flight caps (<= policy ceiling)
+  private inFlight = new Map<string, number>();
+  private waiters = new Map<string, Array<() => void>>();
   private seenSessions = new Set<string>();
   private pinnedIdentity = new Map<string, Record<string, string>>();   // source -> connector identity headers
   private settings = config.requestStrategy;
 
   constructor(private redis: Redis) {}
 
+  // ── Recovery primitives (GatewayControls): public for ops tooling, pre-bound for strategies ──
+
+  setMinInterval(source: string, ms: number, reason: string, by = 'ops'): number {
+    const effective = Math.max(policyFor(source).minIntervalMs, Math.max(0, ms));
+    this.minInterval.set(source, effective);
+    emitFor(source)({ type: 'pacing.changed', minIntervalMs: effective, reason, by, origin: by === 'baseline' ? 'baseline' : 'strategy' });
+    return effective;
+  }
+
+  setConcurrency(source: string, limit: number, reason: string, by = 'ops'): number {
+    const effective = Math.min(policyFor(source).maxConcurrency, Math.max(1, Math.floor(limit)));
+    this.concurrency.set(source, effective);
+    this.wake(source);
+    emitFor(source)({ type: 'concurrency.changed', limit: effective, reason, by, origin: by === 'baseline' ? 'baseline' : 'strategy' });
+    return effective;
+  }
+
+  delayNext(source: string, ms: number, reason: string, by = 'ops'): number {
+    const d = Math.min(Math.max(0, ms), this.settings.timing.maxStrategyDelayMs);
+    this.oneShotDelay.set(source, Math.max(this.oneShotDelay.get(source) ?? 0, d));
+    emitFor(source)({ type: 'timing.adjusted', delayMs: d, reason: `next request: ${reason}`, by, origin: by === 'baseline' ? 'baseline' : 'strategy' });
+    return d;
+  }
+
+  // ── Request path ──
+
   async fetch(req: GatewayRequest): Promise<GatewayResponse> {
     const policy = policyFor(req.source);
     const strategy = strategyFor(req.source, this.settings);
     const proxied = policy.proxy && proxyEnabled();
-    const emit = (e: EventInput) => gatewayEvents.emit({ ...e, source: req.source, flow: req.flow } as Parameters<typeof gatewayEvents.emit>[0]);
+    const emit = emitFor(req.source, req.flow);
     const byStrategy = { by: strategy.name, origin: 'strategy' } as const;
+    const controls = this.boundControls(req.source, strategy.name, emit);
 
     for (let attempt = 0; ; attempt++) {
       // ── Baseline plan: static config headers, then the connector's per-request headers ──
@@ -57,13 +89,14 @@ export class HttpGateway implements Gateway {
       let extraDelayMs = 0;
       const ctx: RequestContext = { req, attempt, policy, settings: this.settings, proxied, sessionMode, headers: { ...headers } };
 
-      // ── Hook 1: beforeRequest ──
-      // EXTENSION POINT: session preference per flow, extra ordinary headers, politeness delay (settings.timing).
+      // ── Hook 1: beforeRequest ──  EXTENSION POINT: session preference, ordinary headers, delay, pacing.
       await strategy.beforeRequest?.(ctx, {
+        ...controls,
         setHeader: (name, value, reason) => {
-          if (IDENTITY_HEADERS.test(name)) {
+          if (IDENTITY_HEADERS.test(name)) {                       // guardrail 1
             emit({ type: 'headers.rejected', names: [name.toLowerCase()],
               reason: `strategies can't set identity headers; use USER_AGENT or CONNECTOR_IDENTITY_HEADERS (${reason})`, ...byStrategy });
+            emit({ type: 'guardrail.applied', rule: 'identity-headers', detail: name.toLowerCase(), ...byStrategy });
             return;
           }
           headers[name.toLowerCase()] = value;
@@ -79,25 +112,26 @@ export class HttpGateway implements Gateway {
           sessionMode = mode;
           emit({ type: 'session.mode', mode, reason, ...byStrategy });
         },
-        note: (name, labels = {}) => emit({ type: 'strategy.note', name, labels, ...byStrategy }),
       });
 
-      // ── Send ──
-      await this.waitTurn(req.source, policy.minIntervalMs, extraDelayMs);
-      if (proxied) await this.checkBudget(req.source);
-      const sticky = !!req.sessionKey && sessionMode === 'sticky';
-      const sessionId = proxied && sticky ? sessionIdFor(req) : undefined;
-      if (sessionId && !this.seenSessions.has(sessionId)) {
-        this.trackSession(sessionId);
-        emit({ type: 'session.started', sessionId, reason: 'new flow', ...BASELINE });
-      }
-      emit({ type: 'request.sent', attempt, proxied, session: !proxied ? 'direct' : sticky ? 'sticky' : 'rotating', sessionId, ...BASELINE });
-
-      const started = performance.now();
+      // ── Send (concurrency slot + pacing) ──
+      const release = await this.acquire(req.source, policy);
       let status: number;
       let resHeaders: Headers;
       let body: Buffer;
+      let ms: number;
       try {
+        await this.waitTurn(req.source, policy, extraDelayMs);
+        if (proxied) await this.checkBudget(req.source);
+        const sticky = !!req.sessionKey && sessionMode === 'sticky';
+        const sessionId = proxied && sticky ? sessionIdFor(req) : undefined;
+        if (sessionId && !this.seenSessions.has(sessionId)) {
+          this.trackSession(sessionId);
+          emit({ type: 'session.started', sessionId, reason: 'new flow', ...BASELINE });
+        }
+        emit({ type: 'request.sent', attempt, proxied, session: !proxied ? 'direct' : sticky ? 'sticky' : 'rotating', sessionId, ...BASELINE });
+
+        const started = performance.now();
         const res = await fetch(req.url, {
           method: req.method ?? 'GET',
           headers,
@@ -108,52 +142,65 @@ export class HttpGateway implements Gateway {
         status = res.status;
         resHeaders = res.headers as unknown as Headers;
         body = Buffer.from(await res.arrayBuffer());
+        ms = Math.round(performance.now() - started);
       } catch (err) {
-        // ── Hook 3a: transport failure (timeout, refused, proxy error) ──
+        if (err instanceof RetryLater) throw err;              // budget exhausted
+        release();
+        // ── Hook 4a: transport failure (timeout, refused, proxy error) ──
         const failure = classifyError(err, proxied);
         emit({ type: 'error.classified', attempt, side: failure.side, kind: failure.kind, message: failure.message, ...BASELINE });
-        const decision = await this.decide(strategy, ctx, failure, req, emit);
+        const decision = await this.decide(strategy, ctx, failure, req, controls, emit);
         if (decision.action === 'retry') {
           await sleep(decision.delayMs);
           continue;
         }
         throw err;                                       // baseline: the job fails; the next scheduled run tries again
+      } finally {
+        release();
       }
 
-      const ms = Math.round(performance.now() - started);
       if (proxied) await this.meter(body.length + (req.body?.length ?? 0) + REQUEST_OVERHEAD_BYTES);
       const verdict: Verdict = status === 429 ? 'throttled' : status === 403 ? 'blocked' : (req.classify?.(status, body) ?? 'ok');
-      emit({ type: 'request.completed', attempt, status, verdict, ms, bytes: body.length, ...BASELINE });
-
-      // ── Hook 2: afterResponse (observe; may only slow down later requests) ──
-      // EXTENSION POINT: adapt pacing to latency or partial errors per source/flow.
-      await strategy.afterResponse?.(ctx, { status, verdict, ms, bytes: body.length }, {
-        slowDownNext: (delayMs, reason) => {
-          const d = Math.min(Math.max(0, delayMs), this.settings.timing.maxStrategyDelayMs);
-          this.slowNext.set(req.source, Math.max(this.slowNext.get(req.source) ?? 0, d));
-          emit({ type: 'timing.adjusted', delayMs: d, reason: `next request: ${reason}`, ...byStrategy });
-        },
-        note: (name, labels = {}) => emit({ type: 'strategy.note', name, labels, ...byStrategy }),
-      });
-
-      // ── Verdicts: fixed baseline handling that strategies can't override ──
-      // EXTENSION POINT (Marketplace recovery): with the full gateway these feed health tracking and the
-      // RecoveryStrategy (cooldown -> probe -> ramp) instead of fixed cooldowns.
       const retryAfterSec = Number(resHeaders.get('retry-after'));
       const retryAfterMs = Number.isFinite(retryAfterSec) && retryAfterSec > 0 ? retryAfterSec * 1000 : undefined;
-      if (verdict === 'throttled') {
-        throw new RetryLater(Date.now() + (retryAfterMs ?? policy.throttledCooldownMs), `${req.source} throttled (${status === 429 ? 'HTTP 429' : 'in-body'})`);
-      }
-      if (verdict === 'blocked') {
-        throw new RetryLater(Date.now() + (retryAfterMs ?? policy.blockedCooldownMs), `${req.source} blocked (${status === 403 ? 'HTTP 403' : 'login wall/checkpoint'})`, 'source');
+      const info = { status, verdict, ms, bytes: body.length, retryAfterMs };
+      emit({ type: 'request.completed', attempt, status, verdict, ms, bytes: body.length, ...BASELINE });
+
+      // ── Hook 2: afterResponse ──  EXTENSION POINT: adapt pacing/concurrency to latency or partial errors.
+      await strategy.afterResponse?.(ctx, info, controls);
+
+      // ── Hook 3: onVerdict (throttled / blocked) ──  EXTENSION POINT (Marketplace recovery): escalating cooldowns,
+      // scope widening, concurrency cuts. The floor (guardrail 2) is applied after the strategy decides.
+      if (verdict === 'throttled' || verdict === 'blocked') {
+        const floor: CooldownPlan = verdict === 'throttled'
+          ? { ms: retryAfterMs ?? policy.throttledCooldownMs, scope: 'search' }
+          : { ms: retryAfterMs ?? policy.blockedCooldownMs, scope: 'source' };
+        let requested: CooldownPlan | undefined;
+        let reason = verdict === 'throttled'
+          ? `throttled (${status === 429 ? 'HTTP 429' : 'in-body'})`
+          : `blocked (${status === 403 ? 'HTTP 403' : 'login wall/checkpoint'})`;
+        await strategy.onVerdict?.(ctx, info, floor, {
+          ...controls,
+          cooldown: (cooldownMs, scope, why) => {
+            requested = { ms: cooldownMs, scope };
+            reason = `${reason}; ${why}`;
+          },
+        });
+        const { plan, clamped } = applyCooldownFloor(requested ?? floor, floor);
+        if (requested && clamped) {
+          emit({ type: 'guardrail.applied', rule: 'cooldown-floor', ...byStrategy,
+            detail: `requested ${requested.ms}ms/${requested.scope}, applied ${plan.ms}ms/${plan.scope}` });
+        }
+        emit({ type: 'cooldown.decided', verdict, ms: plan.ms, scope: plan.scope, reason, ...(requested ? byStrategy : BASELINE) });
+        throw new RetryLater(Date.now() + plan.ms, `${req.source} ${reason}`, plan.scope);
       }
       if (verdict === 'changed') throw new SourceChanged(req.source, 'unexpected response body');
 
       if (status >= 500) {
-        // ── Hook 3b: target server error ──
+        // ── Hook 4b: target server error ──
         const failure: Failure = { side: 'target', kind: `http_${status}`, message: `${req.source} HTTP ${status}` };
         emit({ type: 'error.classified', attempt, side: 'target', kind: failure.kind, message: failure.message, ...BASELINE });
-        const decision = await this.decide(strategy, ctx, failure, req, emit);
+        const decision = await this.decide(strategy, ctx, failure, req, controls, emit);
         if (decision.action === 'retry') {
           await sleep(decision.delayMs);
           continue;
@@ -164,23 +211,29 @@ export class HttpGateway implements Gateway {
     }
   }
 
-  /** Ask the strategy about a retryable failure; enforce the attempt cap and delay cap. */
+  /** Primitives bound to one source and labelled with the strategy that calls them. */
+  private boundControls(source: string, by: string, emit: Emit): SourceControls {
+    return {
+      setMinInterval: (ms, reason) => this.setMinInterval(source, ms, reason, by),
+      setConcurrency: (limit, reason) => this.setConcurrency(source, limit, reason, by),
+      delayNext: (ms, reason) => this.delayNext(source, ms, reason, by),
+      note: (name, labels = {}) => emit({ type: 'strategy.note', name, labels, by, origin: 'strategy' }),
+    };
+  }
+
+  /** Ask the strategy about a retryable failure; enforce the attempt cap, delay cap and guardrail 3. */
   private async decide(strategy: RequestStrategy, ctx: RequestContext, failure: Failure, req: GatewayRequest,
-                       emit: (e: EventInput) => void): Promise<RetryDecision> {
+                       controls: SourceControls, emit: Emit): Promise<RetryDecision> {
     const byStrategy = { by: strategy.name, origin: 'strategy' } as const;
-    const note = (name: string, labels: Record<string, string | number> = {}) => emit({ type: 'strategy.note', name, labels, ...byStrategy });
-    // Identity controls only for proxy-side failures (a dead exit node), never for anything the target said.
-    const act = failure.side === 'proxy'
-      ? {
-          note,
-          rotateSession: (reason: string) => {
-            if (!req.sessionKey) return;                 // rotating requests get a new exit IP anyway
-            const sessionId = rotateSession(req);
-            this.trackSession(sessionId);
-            emit({ type: 'session.rotated', sessionId, reason, ...byStrategy });
-          },
-        }
-      : { note };
+    const act: FailureActions = { ...controls };
+    if (identityChangeAllowed(failure.side)) {
+      act.rotateSession = (reason) => {
+        if (!req.sessionKey) return;                     // rotating requests get a new exit IP anyway
+        const sessionId = rotateSession(req);
+        this.trackSession(sessionId);
+        emit({ type: 'session.rotated', sessionId, reason, ...byStrategy });
+      };
+    }
     const decision = (await strategy.onRetryableError?.(ctx, failure, act)) ?? { action: 'give_up' as const };
     if (decision.action !== 'retry') return decision;
     if (ctx.attempt + 1 >= this.settings.retry.maxAttempts) {
@@ -192,26 +245,50 @@ export class HttpGateway implements Gateway {
     return { ...decision, delayMs };
   }
 
-  /** Space requests to one source at least `minIntervalMs` apart (per process), plus any strategy delay. */
-  private async waitTurn(source: string, minIntervalMs: number, extraDelayMs: number) {
-    const oneShot = this.slowNext.get(source) ?? 0;
-    this.slowNext.delete(source);
+  /** Wait for an in-flight slot for this source. Returns an idempotent release. */
+  private async acquire(source: string, policy: SourcePolicy): Promise<() => void> {
+    while ((this.inFlight.get(source) ?? 0) >= (this.concurrency.get(source) ?? policy.maxConcurrency)) {
+      await new Promise<void>((resolve) => this.waiters.set(source, [...(this.waiters.get(source) ?? []), resolve]));
+    }
+    this.inFlight.set(source, (this.inFlight.get(source) ?? 0) + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.inFlight.set(source, (this.inFlight.get(source) ?? 1) - 1);
+      this.wake(source);
+    };
+  }
+
+  private wake(source: string) {
+    const queue = this.waiters.get(source);
+    if (queue?.length) queue.shift()!();
+  }
+
+  /** Space requests to one source at least the effective min interval apart (per process), plus extra delays. */
+  private async waitTurn(source: string, policy: SourcePolicy, extraDelayMs: number) {
+    const oneShot = this.oneShotDelay.get(source) ?? 0;
+    this.oneShotDelay.delete(source);
+    const interval = this.minInterval.get(source) ?? policy.minIntervalMs;
     const now = Date.now();
     const slot = Math.max(now, this.nextSlot.get(source) ?? 0) + extraDelayMs + oneShot;
-    this.nextSlot.set(source, slot + Math.max(0, minIntervalMs));
+    this.nextSlot.set(source, slot + Math.max(0, interval));
     if (slot > now) await sleep(slot - now);
   }
 
   /**
-   * Connector-supplied identity headers. Default: stripped + headers.rejected. With the source listed in
-   * CONNECTOR_IDENTITY_HEADERS: the first values seen are pinned for that source and applied to every request;
-   * a later, different value is rejected (restart to change), so the opt-in can't turn into per-request rotation.
+   * Connector-supplied identity headers (guardrail 1, static path). Default: stripped + headers.rejected. With the
+   * source listed in CONNECTOR_IDENTITY_HEADERS: the first values seen are pinned for that source and applied to every
+   * request; a later, different value is rejected (restart to change).
    */
-  private connectorIdentity(source: string, offered: Record<string, string>, emit: (e: EventInput) => void): Record<string, string> {
+  private connectorIdentity(source: string, offered: Record<string, string>, emit: Emit): Record<string, string> {
     const names = Object.keys(offered);
     const byConnector = { by: 'connector', origin: 'baseline' } as const;
     if (!this.settings.headers.connectorIdentitySources.includes(source)) {
-      if (names.length) emit({ type: 'headers.rejected', names, reason: `identity headers from a connector need CONNECTOR_IDENTITY_HEADERS=${source}`, ...byConnector });
+      if (names.length) {
+        emit({ type: 'headers.rejected', names, reason: `identity headers from a connector need CONNECTOR_IDENTITY_HEADERS=${source}`, ...byConnector });
+        emit({ type: 'guardrail.applied', rule: 'identity-headers', detail: names.join(','), ...byConnector });
+      }
       return {};
     }
     const pinned = this.pinnedIdentity.get(source) ?? {};
@@ -220,7 +297,10 @@ export class HttpGateway implements Gateway {
     for (const n of added) pinned[n] = offered[n];
     this.pinnedIdentity.set(source, pinned);
     if (added.length) emit({ type: 'headers.applied', names: added, ...byConnector });
-    if (changed.length) emit({ type: 'headers.rejected', names: changed, reason: 'identity headers are pinned per source; restart to change them', ...byConnector });
+    if (changed.length) {
+      emit({ type: 'headers.rejected', names: changed, reason: 'identity headers are pinned per source; restart to change them', ...byConnector });
+      emit({ type: 'guardrail.applied', rule: 'identity-headers', detail: `pinned: ${changed.join(',')}`, ...byConnector });
+    }
     return pinned;
   }
 

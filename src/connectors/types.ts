@@ -1,3 +1,10 @@
+/**
+ * Connector contract: connectors DECLARE, the gateway DECIDES.
+ * A connector states what it needs: URLs, the search area (geo), which requests belong together (flows = session
+ * affinity), protocol headers, and how to read its source's responses. It never chooses proxies, sessions, identity,
+ * timing, retries or cooldowns; those belong to the gateway's strategy layer (src/gateway/strategy.ts). Changing that
+ * layer never requires connector changes.
+ */
 import type { Area } from '../config';
 import type { ListingDraft } from '../domain';
 import type { GatewayResponse, Geo, Verdict } from '../gateway';

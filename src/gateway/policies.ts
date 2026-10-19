@@ -6,15 +6,27 @@
  */
 import { config } from '../config';
 
+/**
+ * Baseline values per source. Strategies adjust behavior at runtime through primitives (strategy.ts); these values
+ * are the starting point, and for pacing and cooldowns also the floor (guardrails.ts).
+ */
 export interface SourcePolicy {
-  minIntervalMs: number;             // politeness: minimum gap between requests to this source (per process)
+  minIntervalMs: number;             // politeness: minimum gap between requests to this source (per process); pacing floor
+  maxConcurrency: number;            // ceiling for in-flight requests per source (setConcurrency clamps to it); Infinity = no cap
   timeoutMs: number;
-  throttledCooldownMs: number;       // pause after a throttle signal with no Retry-After
-  blockedCooldownMs: number;         // pause after a block / login wall. Wait it out; never switch identity to get past it
+  throttledCooldownMs: number;       // cooldown floor after a throttle signal with no Retry-After
+  blockedCooldownMs: number;         // cooldown floor after a block / login wall
   serverErrorCooldownMs: number;     // pause after a 5xx the strategy didn't retry
+  changedPauseMs: number;            // pause for the whole source when its responses change shape (connector needs updating)
 }
 
-const base = { throttledCooldownMs: 10 * 60_000, blockedCooldownMs: 60 * 60_000, serverErrorCooldownMs: 2 * 60_000 };
+const base = {
+  maxConcurrency: Infinity,
+  throttledCooldownMs: 10 * 60_000,
+  blockedCooldownMs: 60 * 60_000,
+  serverErrorCooldownMs: 2 * 60_000,
+  changedPauseMs: 30 * 60_000,
+};
 
 export const policies: Record<string, SourcePolicy> = {
   // Local mock: no pacing, short cooldowns so injected failures recover quickly while testing.

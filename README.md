@@ -74,7 +74,7 @@ PROXY_DAILY_MB=200            # hard daily cap on proxied bandwidth
 1. **Connector:** `src/connectors/facebook.ts` holds the intended shape and a checklist: verify field paths against captured responses, keep the `doc_id` in env, add a detail fetch. Then register it in `src/connectors/index.ts`.
 2. **Response signals:** `classifyMarketplace()` in `src/connectors/marketplace.ts`. Confirm it against real throttle and block responses.
 3. **Pacing and cooldowns:** the `facebook` entry in `src/gateway/policies.ts`.
-4. **Recovery:** `src/gateway/http-gateway.ts`, at the "Verdicts" section. The full FetchGateway (health tracking, cooldown → probe → ramp) replaces `HttpGateway` in `createGateway()` (`src/gateway/index.ts`).
+4. **Recovery:** a strategy's `onVerdict` / `onRetryableError` hooks, using the recovery primitives. The full FetchGateway (health tracking, cooldown → probe → ramp) replaces `HttpGateway` in `createGateway()` (`src/gateway/index.ts`).
 5. **Request strategies:** `src/gateway/strategy.ts`. Register one and select it with `REQUEST_STRATEGY=facebook=<name>`.
 6. **Proxy:** the env vars above. Add `facebook` to `PROXY_SOURCES`; it's already the default.
 7. **Alerts to a human:** the `SourceChanged` handler in `src/ingest/worker.ts`.
@@ -86,26 +86,43 @@ Boundaries in the design:
 
 ## Request strategies
 
-`src/gateway/strategy.ts` defines three hooks per gateway request. The default strategy does nothing, so behaviour is the baseline.
+**Connectors declare, the gateway decides.** A connector states its URLs, search area, flows (which requests share a session), protocol headers and how to read its source's responses. Every request-handling decision lives in the gateway's strategy layer (`src/gateway/strategy.ts`). Adding or swapping a strategy never touches connectors, the normalizer, outbox, indexer or API: register it and select it with `REQUEST_STRATEGY=<source>=<name>`.
 
 | Hook | When | What a strategy can do |
 |---|---|---|
 | `beforeRequest` | Before every attempt | Add ordinary headers, add delay, choose a sticky or rotating session |
-| `afterResponse` | After the response is classified | Observe it, and slow down the next request to the source |
-| `onRetryableError` | Proxy/network failure or target 5xx | Retry (bounded by `REQUEST_MAX_ATTEMPTS`) or give up. Only proxy-side failures offer `rotateSession` |
+| `afterResponse` | After the response is classified | Observe; adjust pacing or concurrency for later requests |
+| `onVerdict` | Throttled or blocked | Choose cooldown length and scope at or above the floor; slow the source |
+| `onRetryableError` | Proxy/network failure or target 5xx | Retry (bounded by `REQUEST_MAX_ATTEMPTS`) or give up. `rotateSession` is present only for proxy-side failures |
 
-**Rules the gateway enforces whatever the strategy does:**
-- A throttled or blocked response always ends in the policy cooldown. Strategies can't retry through it or shorten it.
-- Identity headers (`user-agent`, `sec-ch-ua*`) can never be set by a strategy. There are two supported static ways to set them:
-  - `USER_AGENT` in config, for all sources.
-  - A connector's own headers, once its source is listed in `CONNECTOR_IDENTITY_HEADERS`. The first values seen are pinned for that source until restart, and the worker logs that the override is on.
+**Recovery primitives** are available in every hook, bound to the request's source. They're also public on the gateway for ops tooling:
+- `setMinInterval`: pacing, never below the policy value.
+- `setConcurrency`: 1 up to the policy's `maxConcurrency`.
+- `delayNext`: a one-shot delay before the next request.
 
-  Anything else is stripped and reported as `headers.rejected`.
-- Delay can only be added, and it is capped.
+Cooldowns are set through `onVerdict`. Session rotation is offered in `onRetryableError`. Built-in examples, registered but off by default:
+- `retry-proxy-once`: retries a proxy failure once on a fresh session.
+- `conservative-backoff`: doubles the throttle cooldown and drops concurrency to 1.
 
-**Settings** live in the `RequestStrategySettings` type in `src/config.ts`: session mode, header settings, timing ranges, retry limits and event logging. Each is loaded from env, and the defaults change nothing.
+**Guardrails** (`src/gateway/guardrails.ts`) are three fixed rules; everything else is open:
+1. **Identity headers.** `user-agent` and `sec-ch-ua*` never come from a strategy. The static ways to set them are `USER_AGENT`, or a connector's headers for sources listed in `CONNECTOR_IDENTITY_HEADERS` (pinned per source, and logged at startup).
+2. **Cooldown floor.** A throttle or block always ends in a cooldown at least as long as `Retry-After` or the policy value, and at least as wide as the gateway's scope. Strategies can lengthen or widen it.
+3. **Identity changes.** Session rotation happens only after proxy-side failures, never in response to the target. Proxy routing is config (`PROXY_SOURCES`).
 
-**Events** (`src/gateway/events.ts`) are structured and labelled `origin: baseline | strategy`, with `by: <strategy name>`. They cover requests, sessions, headers (names only), timing, error classification and retries. Set `GATEWAY_EVENTS=log` to print them.
+Each time a rule applies, a `guardrail.applied` event records it.
+
+**Settings** live in the `RequestStrategySettings` type in `src/config.ts`: session mode, headers, timing ranges, retries and event logging. They load from env, and the defaults change nothing. Per-source baselines and floors are in `src/gateway/policies.ts`.
+
+**Events** (`src/gateway/events.ts`) are labelled `origin: baseline | strategy` with `by: <strategy name>`. They cover:
+- requests and their verdicts
+- session starts and rotations
+- headers (names only)
+- timing, pacing and concurrency changes
+- cooldown decisions
+- error classification and retries
+- guardrail applications
+
+Set `GATEWAY_EVENTS=log` to print them.
 
 ## API
 

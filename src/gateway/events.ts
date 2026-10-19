@@ -32,6 +32,10 @@ export type GatewayEvent = Base &
     | { type: 'error.classified'; attempt: number; side: Side; kind: string; message: string }
     | { type: 'retry.scheduled'; attempt: number; side: Side; delayMs: number; reason: string }
     | { type: 'retry.refused'; attempt: number; side: Side; reason: string }
+    | { type: 'cooldown.decided'; verdict: Verdict; ms: number; scope: 'search' | 'source'; reason: string }
+    | { type: 'pacing.changed'; minIntervalMs: number; reason: string }
+    | { type: 'concurrency.changed'; limit: number; reason: string }
+    | { type: 'guardrail.applied'; rule: 'identity-headers' | 'cooldown-floor' | 'identity-change'; detail: string }
     | { type: 'strategy.note'; name: string; labels: Record<string, string | number> }
   );
 
