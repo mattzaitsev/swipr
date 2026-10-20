@@ -63,9 +63,13 @@ interface PrevRow {
  * Raw item -> raw_events + listings/sellers/images/price_history + outbox, in one transaction.
  * Idempotent: replaying the same payload changes nothing but last_seen_at and image URL signatures.
  */
-export async function normalize(connector: Connector, item: RawItem): Promise<NormalizeResult> {
+export async function normalize(connector: Connector, item: RawItem): Promise<{ status: NormalizeResult; draft: ListingDraft | null }> {
   const draft = connector.parse(item);
+  const status = await store(connector, item, draft);
+  return { status, draft };
+}
 
+async function store(connector: Connector, item: RawItem, draft: ListingDraft | null): Promise<NormalizeResult> {
   return tx(async (c) => {
     // Serialize concurrent work on the same listing (overlapping searches return the same item).
     await c.query(`select pg_advisory_xact_lock(hashtext($1))`, [`${connector.source}:${item.externalId}`]);

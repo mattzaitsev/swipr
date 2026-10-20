@@ -1,5 +1,8 @@
 import { config } from '../config';
+import { logger } from '../runtime';
+import { createFacebookConnector } from './facebook';
 import { createMarketplaceConnector } from './marketplace';
+import { OFFERUP_PENDING } from './offerup';
 import type { Connector } from './types';
 
 /** The local mock marketplace (src/dev/mock-source.ts): same wire shape as the real connector, zero cost. */
@@ -15,10 +18,21 @@ export const mockConnector = createMarketplaceConnector({
 });
 
 /**
- * ─── EXTENSION POINT: register real connectors here ───
- * Facebook Marketplace: build `facebookConnector` in ./facebook.ts (checklist there), then add it below.
+ * ─── EXTENSION POINT: register connectors here ───
+ * SOURCES picks which ones run (default: mock only). The personal sniper runs SOURCES=facebook;
+ * watches in watches.json choose what each one searches for.
  */
-export const connectors: Connector[] = [mockConnector];
+const available: Record<string, () => Connector> = {
+  mock: () => mockConnector,
+  facebook: () => createFacebookConnector(),
+};
+const pending: Record<string, string> = { offerup: OFFERUP_PENDING };
+
+export const connectors: Connector[] = config.sources.flatMap((source) => {
+  if (available[source]) return [available[source]()];
+  logger('ingest')(`SOURCES includes "${source}": ${pending[source] ?? 'no connector with that name'}; skipping it`);
+  return [];
+});
 
 export function getConnector(source: string): Connector {
   const connector = connectors.find((c) => c.source === source);

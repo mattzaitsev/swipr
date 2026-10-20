@@ -8,6 +8,7 @@
  */
 import { config, type Area } from '../config';
 import type { Condition, ListingDraft } from '../domain';
+import { placeCentroid } from '../geo/places';
 import { SourceChanged, type Verdict } from '../gateway';
 import type { Connector, CrawlTask, RawItem, SearchSpec } from './types';
 
@@ -124,10 +125,13 @@ export function parseMarketplaceListing(item: RawItem, source: string, listingUr
   const rg = l.location?.reverse_geocode;
   const city = rg?.city ?? rg?.city_page?.display_name?.split(',')[0];
   const area: Area = item.context.area;
-  // Search results give approximate coordinates at best. Without them, fall back to the search area's centre.
+  // Best available position: the source's (fuzzed) coordinates, else the city's centroid, else the search area's centre.
+  const centroid = placeCentroid(city, rg?.state);
   const location = typeof l.location?.latitude === 'number' && typeof l.location?.longitude === 'number'
     ? { lat: l.location.latitude, lng: l.location.longitude, precision: 'approximate' as const, city, region: rg?.state, country: area.country }
-    : { lat: area.lat, lng: area.lng, precision: 'area' as const, city: city ?? area.city, region: rg?.state ?? area.region, country: area.country };
+    : centroid
+      ? { ...centroid, precision: 'city' as const, city, region: rg?.state, country: area.country }
+      : { lat: area.lat, lng: area.lng, precision: 'area' as const, city: city ?? area.city, region: rg?.state ?? area.region, country: area.country };
 
   const seller = l.marketplace_listing_seller;
   const images = [l.primary_listing_photo?.image?.uri, ...(l.listing_photos ?? []).map((p) => p.image?.uri)]

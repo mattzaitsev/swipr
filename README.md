@@ -25,6 +25,7 @@ You need Docker Desktop. Node is optional and only used for the host-side script
 | | Command |
 |---|---|
 | Start everything (build + run) | `docker compose up -d --build` |
+| Open the UI | http://localhost:4200/ui |
 | Watch logs | `docker compose logs -f app` |
 | Check the pipeline end to end | `docker compose exec app node --import tsx src/scripts/smoke.ts` |
 | Stop (keeps data) | `docker compose down` |
@@ -39,6 +40,48 @@ With Node installed, the npm shortcuts are `npm run up | logs | down | reset | s
 - **Running the app on the host instead:** `docker compose up -d postgres redis typesense`, then `npm install && npm run dev`. Stop the `app` container first so the two don't crawl twice.
 
 **What to search** is set in `search.config.json` as queries × areas, where each area is a point, a radius, and a country/region. **Everything else** is in `.env`; copy `.env.example`. Every setting has a default that works locally.
+
+## Personal deal sniper (Facebook Marketplace)
+
+The sniper watches Facebook Marketplace for new listings near you and alerts your phone within minutes, with no login. Each watch in `watches.json` is a newest-first search. The sniper reads only page 1, which is what a logged-out visitor sees, and alerts on listings that weren't there last time.
+
+1. **Edit `watches.json`.** Set the area (default: Downtown San Diego, 40 mi) and your watches: `query`, plus optional `minPrice`/`maxPrice`, `include`/`exclude` words, `everySec` (at least 60) and `maxAgeMin`.
+2. **Phone alerts.** Install the ntfy app and subscribe to a topic name nobody could guess. Set `NTFY_TOPIC` to that name. Without it, alerts appear only in `docker compose logs -f app`.
+3. **Test offline first.** This runs the real Facebook connector against the local mock, so no Facebook requests are made:
+   `SOURCES=facebook FACEBOOK_BASE_URL=http://localhost:4210 docker compose up -d`
+4. **Go live.** Set `SOURCES=facebook` and leave `FACEBOOK_BASE_URL` unset. Then check the logs during the first few minutes (see "First live run").
+
+**How it behaves:**
+- **Baseline.** A watch's first check records what's already up and alerts only on listings younger than `maxAgeMin`. After that, any listing new to the feed is a candidate.
+- **One alert per listing**, even when several watches match it.
+- **Filters.** A listing must be active, within your price range and words, younger than `maxAgeMin`, and within the radius. Facebook only gives a city, so position uses a city table in `src/geo/places.ts`. Listings in other states (e.g. Tijuana) are skipped.
+- **Politeness.** At least 4 s between requests and at least 60 s between checks of one watch.
+- **Login wall.** A page with no results is treated as a login wall and pauses all Facebook checks for 60 minutes.
+- **Changed page.** If the page shape changes, you get one alert and Facebook checks pause for 30 minutes.
+
+**What the first live run showed (2026-10-19):**
+- **It works.** The request headers return 24 embedded listings per search, and the `minPrice`/`maxPrice` URL parameters are applied by Facebook.
+- **Logged-out results are delayed.** Facebook treats cookie-less requests as a crawler and serves them a search snapshot that runs **1–2 hours behind** what a signed-in browser sees. Its responses are marked `no-store`, so this is deliberate, not a cache. Fresh results are reserved for the browser path. Getting them would mean disguising the agent as a browser, which this project doesn't do.
+- **What that means for alerts.** Alerts arrive roughly 1–2 hours after posting. Set `maxAgeMin` to at least 120, or nothing qualifies. For real-time alerts, use Facebook's own saved-search notifications in the app.
+
+Price is also enforced locally, so the second is harmless if Facebook ignores it. If the logs show `response shape changed`, adjust the headers.
+
+**OfferUp** isn't fitted yet. It needs one saved logged-out search page; see `src/connectors/offerup.ts`.
+
+**Boundaries:** logged out, page 1 only, cooldowns on throttles and blocks, no browser impersonation. Automated collection is against Facebook's terms; this is for personal use.
+
+## UI and live web search
+
+http://localhost:4200/ui is a single page (`web/index.html`, no build step) with two tabs. Both centre on the first area in `search.config.json`: Downtown San Diego, 40 mi.
+
+- **Web:** live results from the Oxylabs Web API through `GET /web-search` (`src/integrations/oxylabs.ts`).
+  - The key stays on the server.
+  - Results rank for the area's country and add the city to the query.
+  - Marketplace sites are tagged, and prices are pulled out of the snippets.
+  - Results are cached for 10 minutes, and searches are capped at 30 per minute, because every upstream call spends credits.
+- **Listings:** swipr's own index (`GET /search`) within the area radius, with sort and "Load more".
+
+**Enabling web search:** set `OXYLABS_WEB_API_KEY` as a user environment variable, then run `docker compose up -d` from a shell that has it. Compose passes it into the app container. Without it the Web tab says it isn't configured.
 
 ## Adding a residential proxy later (no code changes)
 
@@ -130,11 +173,11 @@ Saved-search routes need an `x-user-id` header. That's Beta auth; see `userId()`
 
 ```bash
 # keyword + geo + filters (prices in dollars); sort: relevance|newest|price_asc|price_desc|distance
-curl "localhost:4200/search?q=couch&lat=30.2672&lng=-97.7431&radius_km=25&max_price=500"
+curl "localhost:4200/search?q=couch&lat=32.7157&lng=-117.1611&radius_km=64.4&max_price=500"
 curl "localhost:4200/search?sort=newest&limit=20&cursor=<next_cursor>"
 curl "localhost:4200/listings/1"
 curl -X POST localhost:4200/saved-searches -H "x-user-id: me" -H "content-type: application/json" \
-  -d '{"name":"Cheap couches","query":"couch","lat":30.2672,"lng":-97.7431,"radius_km":25,"max_price":400}'
+  -d '{"name":"Cheap couches","query":"couch","lat":32.7157,"lng":-117.1611,"radius_km":64.4,"max_price":400}'
 curl -H "x-user-id: me" localhost:4200/saved-searches/1/hits
 ```
 

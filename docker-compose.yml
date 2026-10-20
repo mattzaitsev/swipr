@@ -46,13 +46,19 @@ services:
       TYPESENSE_URL: http://typesense:8108
       TYPESENSE_API_KEY: ${TYPESENSE_API_KEY:-swipr-dev-key}
       BIND_HOST: 0.0.0.0
+      OXYLABS_WEB_API_KEY: ${OXYLABS_WEB_API_KEY:-}   # live web search (/web-search); empty = disabled
+      SOURCES: ${SOURCES:-mock}                       # mock (default, zero cost) | facebook (personal sniper)
+      FACEBOOK_BASE_URL: ${FACEBOOK_BASE_URL:-https://www.facebook.com}   # http://localhost:4210 = test against the mock
+      NTFY_TOPIC: ${NTFY_TOPIC:-}                     # phone alerts via the ntfy app; empty = alerts only in the logs
     ports:
-      - "127.0.0.1:4200:4200"                 # API
+      - "127.0.0.1:4200:4200"                 # API + UI (http://localhost:4200/ui)
       - "127.0.0.1:4210:4210"                 # mock marketplace (its image URLs open in your browser)
     volumes:                                  # edit code on the host, then `docker compose restart app`
       - ./src:/app/src:ro
       - ./db:/app/db:ro
+      - ./web:/app/web:ro
       - ./search.config.json:/app/search.config.json:ro
+      - ./watches.json:/app/watches.json:ro
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }

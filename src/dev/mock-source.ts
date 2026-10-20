@@ -20,10 +20,19 @@ const log = logger('mock');
 const PUBLIC = config.mock.publicUrl;
 const ACCEPTED_DOC_ID = process.env.MOCK_ACCEPT_DOC_ID || 'mock-search-v1';   // change it to simulate a rotation
 
+// San Diego County, all within ~40 miles of Downtown San Diego (the default search area).
 const CITIES = [
-  { city: 'Austin', region: 'TX', lat: 30.2672, lng: -97.7431 },
-  { city: 'Phoenix', region: 'AZ', lat: 33.4484, lng: -112.074 },
-  { city: 'Seattle', region: 'WA', lat: 47.6062, lng: -122.3321 },
+  { city: 'San Diego', region: 'CA', lat: 32.7157, lng: -117.1611 },
+  { city: 'San Diego', region: 'CA', lat: 32.8328, lng: -117.2713 },   // La Jolla
+  { city: 'Chula Vista', region: 'CA', lat: 32.6401, lng: -117.0842 },
+  { city: 'El Cajon', region: 'CA', lat: 32.7948, lng: -116.9625 },
+  { city: 'Escondido', region: 'CA', lat: 33.1192, lng: -117.0864 },
+  { city: 'Carlsbad', region: 'CA', lat: 33.1581, lng: -117.3506 },
+  { city: 'Oceanside', region: 'CA', lat: 33.1959, lng: -117.3795 },
+  { city: 'Santee', region: 'CA', lat: 32.8384, lng: -116.9739 },
+  // Outside the 40-mile area, like the real "San Diego" feed returns: the sniper's radius/state filters drop these.
+  { city: 'Temecula', region: 'CA', lat: 33.4936, lng: -117.1484 },
+  { city: 'Tijuana', region: 'Baja California', lat: 32.5149, lng: -117.0382 },
 ];
 const CATALOG: Array<[string, number]> = [
   ['Sectional couch', 450], ['Leather couch', 380], ['Mid-century sofa couch', 520], ['IKEA Kallax shelf', 60],
@@ -69,8 +78,8 @@ function makeItem(rand: () => number, created: number): Item {
     title,
     priceCents: free ? 0 : Math.max(5, Math.round((base * (0.6 + rand() * 0.7)) / 5) * 5) * 100,
     status: 'available',
-    lat: place.lat + (rand() - 0.5) * 0.5,
-    lng: place.lng + (rand() - 0.5) * 0.5,
+    lat: place.lat + (rand() - 0.5) * 0.16,          // within ~9 km of the town centre
+    lng: place.lng + (rand() - 0.5) * 0.16,
     hasCoords: rand() < 0.8,
     city: place.city,
     region: place.region,
@@ -184,6 +193,39 @@ function placeholderSvg(name: string) {
   <text x="300" y="480" font-family="sans-serif" font-size="30" text-anchor="middle" fill="hsl(${hue} 40% 25%)">${name}</text></svg>`;
 }
 
+/**
+ * Facebook-style logged-out search page: the listings embedded as JSON in a <script type="application/json"> block
+ * under marketplace_search.feed_units, page 1 only (24), newest first, no coordinates, and a login form in the
+ * markup, as on the real page. Lets the real Facebook connector run end to end offline (FACEBOOK_BASE_URL=mock).
+ */
+function facebookSearchPage(params: URLSearchParams): string {
+  const terms = (params.get('query') ?? '').toLowerCase().split(/\s+/).filter(Boolean);
+  const min = params.has('minPrice') ? Number(params.get('minPrice')) * 100 : -Infinity;
+  const max = params.has('maxPrice') ? Number(params.get('maxPrice')) * 100 : Infinity;
+  const soldCutoff = Date.now() - 10 * 60_000;
+  const page = items
+    .filter((it) => it.status !== 'sold' || (it.soldAt ?? 0) > soldCutoff)
+    .filter((it) => terms.every((t) => it.title.toLowerCase().includes(t)))
+    .filter((it) => it.priceCents >= min && it.priceCents <= max)
+    .sort((a, b) => b.created - a.created)
+    .slice(0, 24);
+  const edges = page.map((it) => {
+    const listing = toListing(it);
+    const rg = listing.location?.reverse_geocode;
+    listing.location = { reverse_geocode: rg };                // real search results carry a city, not coordinates
+    return { node: { __typename: 'MarketplaceFeedListingStoryObject', listing } };
+  });
+  const payload = {
+    require: [['ScheduledServerJS', 'handle', null, [{ __bbox: { result: { data: {
+      marketplace_search: { feed_units: { edges, page_info: { has_next_page: true, end_cursor: '{"pg":0}' } } },
+    } } } }]]],
+  };
+  const json = JSON.stringify(payload).replace(/</g, '\\u003c');
+  return `<!doctype html><html><head><title>Facebook</title></head><body>
+<form id="login_form" action="/login/"><input name="email"><input name="pass" type="password"></form>
+<script type="application/json" data-sjs>${json}</script></body></html>`;
+}
+
 const readBody = (req: http.IncomingMessage) =>
   new Promise<string>((resolve) => {
     let data = '';
@@ -218,6 +260,15 @@ export async function start() {
       const id = url.pathname.split('/').pop()!.replace(/_n\.svg$/, '');
       const it = items.find((x) => x.id === id);
       return res.writeHead(200, { 'content-type': 'image/svg+xml', 'cache-control': 'public, max-age=3600' }).end(placeholderSvg(it?.title ?? id));
+    }
+
+    if (/^\/marketplace\/[^/]+\/search\/?$/.test(url.pathname)) {
+      if (config.mock.failRate > 0 && Math.random() < config.mock.failRate) {
+        // A logged-out page with no results embedded, just the login form: what a login wall looks like.
+        return res.writeHead(200, { 'content-type': 'text/html' })
+          .end('<!doctype html><html><body><form id="login_form" action="/login/"></form></body></html>');
+      }
+      return res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }).end(facebookSearchPage(url.searchParams));
     }
 
     const item = url.pathname.match(/^\/marketplace\/item\/(\d+)\/?$/);

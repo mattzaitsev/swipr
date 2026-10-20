@@ -12,6 +12,7 @@ import { config } from '../config';
  */
 export interface SourcePolicy {
   minIntervalMs: number;             // politeness: minimum gap between requests to this source (per process); pacing floor
+  minPollIntervalMs: number;         // politeness: no single search/watch is checked more often than this
   maxConcurrency: number;            // ceiling for in-flight requests per source (setConcurrency clamps to it); Infinity = no cap
   timeoutMs: number;
   throttledCooldownMs: number;       // cooldown floor after a throttle signal with no Retry-After
@@ -21,6 +22,7 @@ export interface SourcePolicy {
 }
 
 const base = {
+  minPollIntervalMs: 60_000,
   maxConcurrency: Infinity,
   throttledCooldownMs: 10 * 60_000,
   blockedCooldownMs: 60 * 60_000,
@@ -30,11 +32,11 @@ const base = {
 
 export const policies: Record<string, SourcePolicy> = {
   // Local mock: no pacing, short cooldowns so injected failures recover quickly while testing.
-  mock: { ...base, minIntervalMs: 0, timeoutMs: 10_000, throttledCooldownMs: 30_000, blockedCooldownMs: 60_000, serverErrorCooldownMs: 15_000 },
+  mock: { ...base, minIntervalMs: 0, minPollIntervalMs: 5_000, timeoutMs: 10_000, throttledCooldownMs: 30_000, blockedCooldownMs: 60_000, serverErrorCooldownMs: 15_000 },
 
-  // Facebook Marketplace (connector not implemented yet). Starting values: a few seconds between requests per
-  // worker process, long cooldowns. Real load is set by crawl cadence (see facebook.ts).
-  facebook: { ...base, minIntervalMs: 4_000, timeoutMs: 20_000 },
+  // Facebook Marketplace, logged out, page 1 only. At least 4 s between any two requests, no watch more often than
+  // once a minute, long cooldowns on throttles (10 min) and login walls (60 min, whole source).
+  facebook: { ...base, minIntervalMs: 4_000, minPollIntervalMs: 60_000, timeoutMs: 20_000 },
 };
 
 /** The policy for a source, plus whether it goes through the proxy (PROXY_SOURCES is the only switch for that). */

@@ -9,6 +9,7 @@ import type { Area } from '../config';
 import type { ListingDraft } from '../domain';
 import type { GatewayResponse, Geo, Verdict } from '../gateway';
 import type { Logger } from '../runtime';
+import type { Watch } from '../watches';
 
 /** One location-scoped search: a query near a point within a radius (how Marketplace search works). */
 export interface SearchSpec {
@@ -16,6 +17,10 @@ export interface SearchSpec {
   query: string;
   area: Area;
   maxPages: number;
+  /** Set when the search comes from a sniper watch (watches.json): alerts are evaluated against it. */
+  watch?: Watch;
+  /** Per-search polling interval for 'new' runs (otherwise the connector's cadence). Floored by policy.minPollIntervalMs. */
+  everyMs?: number;
 }
 
 /**
@@ -69,7 +74,7 @@ export interface ConnectorContext {
 
 export interface Connector {
   readonly source: string;
-  /** How often each search runs in each mode. Keep this conservative for real sources. */
+  /** How often each search runs in each mode. refreshEveryMs <= 0 = no refresh runs (page-1-only sources). */
   readonly cadence: { newEveryMs: number; refreshEveryMs: number };
 
   /** The searches to run (queries x areas, usually from search.config.json). */

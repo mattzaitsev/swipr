@@ -1,7 +1,9 @@
 /**
- * Ingest process. Every connector search runs on two BullMQ schedules:
- *   new      (frequent): newest first, stop at listings we already have
+ * Ingest process. Every connector search runs on BullMQ schedules:
+ *   new      (frequent): newest first, stop at listings we already have (sniper watches: their own everySec)
  *   refresh  (rare):     all pages, to catch price/status changes and renew expiring image URLs
+ *                        (skipped for page-1-only sources such as Facebook logged out)
+ * After a crawl of a sniper watch's feed, the sniper decides which new listings to alert on.
  * Each run: connector.crawl() --gateway--> source  =>  raw items  =>  normalize()  =>  Postgres + outbox
  *
  * The worker makes no request-handling decisions. It carries out the gateway's (RetryLater: pause this search or
@@ -18,6 +20,10 @@ import { policyFor } from '../gateway/policies';
 import { describeProxy, proxyEnabled } from '../gateway/proxy';
 import { bullConnection, createRedis } from '../redis';
 import { isMain, logger, runMain } from '../runtime';
+import { createNotifiers } from '../alerts/notify';
+import { redisSniperStore, Sniper } from '../alerts/sniper';
+import type { ListingDraft } from '../domain';
+import { loadWatches } from '../watches';
 import { normalize, type NormalizeResult } from './normalize';
 
 const log = logger('ingest');
@@ -42,10 +48,14 @@ export async function start() {
   const wanted = new Set<string>();
   for (const connector of connectors) {
     for (const search of connector.searches()) {
-      for (const mode of ['new', 'refresh'] as const) {
+      const modes = connector.cadence.refreshEveryMs > 0 ? (['new', 'refresh'] as const) : (['new'] as const);
+      for (const mode of modes) {
         const id = `${searchId(search)}:${mode}`;
         wanted.add(id);
-        const every = mode === 'new' ? connector.cadence.newEveryMs : connector.cadence.refreshEveryMs;
+        // Politeness floor per source (policy.minPollIntervalMs), whatever a watch asks for.
+        const every = mode === 'new'
+          ? Math.max(search.everyMs ?? connector.cadence.newEveryMs, policyFor(search.source).minPollIntervalMs)
+          : connector.cadence.refreshEveryMs;
         await queue.upsertJobScheduler(id, { every }, {
           name: mode,
           data: { ...search, mode },
@@ -62,6 +72,7 @@ export async function start() {
   for (const connector of connectors) await redis.del(`${sourcePauseKey(connector.source)}:changed`);
 
   const gateway = createGateway(redis);
+  const sniper = new Sniper(redisSniperStore(redis), createNotifiers(redis), loadWatches()?.area ?? null);
   if (config.requestStrategy.events === 'log') logGatewayEvents();
   const worker = new Worker<CrawlTask>(
     'ingest',
@@ -79,10 +90,14 @@ export async function start() {
         openFlow: (kind: string, options?: Parameters<typeof openFlow>[4]) => openFlow(gateway, connector, task, kind, options),
         known: (ids: string[]) => known(task.source, ids),
       };
+      const drafts: ListingDraft[] = [];
       try {
         for await (const item of connector.crawl(task, ctx)) {
-          counts[await normalize(connector, item)]++;
+          const { status, draft } = await normalize(connector, item);
+          counts[status]++;
+          if (draft) drafts.push(draft);
         }
+        if (task.watch) await sniper.onCrawl(task, drafts);
       } catch (err) {
         // "Not now": remember it for this search and let scheduled runs skip until then. Nothing fails, nothing piles up,
         // and items already normalized are kept (normalize is idempotent).
@@ -115,7 +130,9 @@ export async function start() {
   const outbound = proxyEnabled()
     ? `proxy ${describeProxy()} for [${config.proxy.sources.join(', ')}], direct for the rest`
     : 'all direct (PROXY_URL not set)';
-  log(`${searches} searches scheduled (new + refresh); outbound: ${outbound}`);
+  log(`${searches} searches scheduled; outbound: ${outbound}`);
+  const notifiers = createNotifiers(redis).map((n) => n.name).join(' + ');
+  if (connectors.some((c) => c.searches().some((s) => s.watch))) log(`sniper alerts: ${notifiers}${config.alerts.ntfyTopic ? '' : ' (set NTFY_TOPIC for phone alerts)'}`);
   const identitySources = config.requestStrategy.headers.connectorIdentitySources;
   if (identitySources.length) log(`connector identity headers ENABLED for [${identitySources.join(', ')}] (pinned per source)`);
   return async () => {

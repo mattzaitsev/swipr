@@ -94,6 +94,23 @@ export const config = {
   bindHost: env('BIND_HOST', '127.0.0.1'), // the app container sets 0.0.0.0
   apiPort: num('API_PORT', 4200),
   ingestConcurrency: num('INGEST_CONCURRENCY', 2),
+
+  /**
+   * Which connectors run. Default: only the local mock (zero cost, touches no real site).
+   * Personal sniper: SOURCES=facebook (OfferUp joins once its connector is fitted; see src/connectors/offerup.ts).
+   */
+  sources: env('SOURCES', 'mock').split(',').map((s) => s.trim()).filter(Boolean),
+
+  /** Facebook connector target. Point it at the mock (http://localhost:4210) to test the real connector offline. */
+  facebook: {
+    baseUrl: env('FACEBOOK_BASE_URL', 'https://www.facebook.com').replace(/\/$/, ''),
+  },
+
+  /** Phone alerts for the sniper. No NTFY_TOPIC = alerts are only logged. */
+  alerts: {
+    ntfyServer: env('NTFY_SERVER', 'https://ntfy.sh').replace(/\/$/, ''),
+    ntfyTopic: env('NTFY_TOPIC', ''),          // pick something unguessable: anyone who knows the topic can read it
+  },
   search,
 
   /**

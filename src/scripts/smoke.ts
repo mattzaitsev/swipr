@@ -8,7 +8,8 @@ import { config } from '../config';
 import { runMain, sleep } from '../runtime';
 
 const API = `http://localhost:${config.apiPort}`;
-const AUSTIN = { lat: 30.2672, lng: -97.7431 };
+const SAN_DIEGO = { lat: 32.7157, lng: -117.1611 };   // Downtown San Diego
+const RADIUS_KM = 64.4;                                 // 40 miles
 
 async function get(path: string, init?: RequestInit) {
   const headers: Record<string, string> = { 'x-user-id': 'smoke-user' };
@@ -42,16 +43,16 @@ runMain(async () => {
   // Saved searches match listings that arrive *after* they're created (reverse search on new listings).
   const saved = await get('/saved-searches', {
     method: 'POST',
-    body: JSON.stringify({ name: 'Anything near Austin under $2000', ...AUSTIN, radius_km: 30, max_price: 2000 }),
+    body: JSON.stringify({ name: 'Anything within 40 mi of San Diego under $2000', ...SAN_DIEGO, radius_km: RADIUS_KM, max_price: 2000 }),
   });
   check('create saved search', saved.id > 0, `#${saved.id}`);
 
   const first = await waitFor('listings indexed', async () => {
-    const r = await get(`/search?q=couch&lat=${AUSTIN.lat}&lng=${AUSTIN.lng}&radius_km=30`);
+    const r = await get(`/search?q=couch&lat=${SAN_DIEGO.lat}&lng=${SAN_DIEGO.lng}&radius_km=${RADIUS_KM}`);
     return r.items.length ? r : undefined;
   });
   if (first) {
-    check('keyword + geo search', first.items.every((i: any) => i.distance_km <= 30), `${first.total} couches within 30 km of Austin`);
+    check('keyword + geo search', first.items.every((i: any) => i.distance_km <= RADIUS_KM), `${first.total} couches within 40 mi of San Diego`);
     check('fresh image URLs from Postgres', first.items.every((i: any) => typeof i.image === 'string' && i.image.includes('oe=')));
     const img = await fetch(first.items[0].image);
     check('image URL loads', img.ok, `${img.status} ${img.headers.get('content-type')}`);

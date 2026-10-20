@@ -1,0 +1,635 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>swipr · search</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --surface: #ffffff; --surface-2: #efede8; --text: #18160f; --muted: #6d695f; --faint: #9a958a;
+    --line: #e3e0d8; --accent: #f2541b; --accent-ink: #ffffff; --accent-soft: #fde6dc; --accent-text: #b83b0c;
+    --ok: #1d7f49; --danger: #b42318; --danger-soft: #fdecea;
+    --radius: 14px; --shadow: 0 1px 2px rgba(20, 16, 8, .05), 0 6px 20px rgba(20, 16, 8, .05);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #100f0d; --surface: #191815; --surface-2: #23211d; --text: #f2efe8; --muted: #a39e93; --faint: #77726a;
+      --line: #2d2b26; --accent: #ff6a35; --accent-ink: #1a0a03; --accent-soft: #3a1d10; --accent-text: #ff9a72;
+      --ok: #4cc283; --danger: #ff8a80; --danger-soft: #3a1714;
+      --shadow: 0 1px 2px rgba(0, 0, 0, .3), 0 6px 20px rgba(0, 0, 0, .25);
+    }
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+  a { color: inherit; }
+  button, input, select { font: inherit; color: inherit; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .top {
+    position: sticky; top: 0; z-index: 5; display: flex; align-items: center; gap: 10px;
+    padding: 12px 20px; background: color-mix(in srgb, var(--bg) 88%, transparent);
+    backdrop-filter: blur(10px); border-bottom: 1px solid var(--line);
+  }
+  .brand { font-weight: 800; font-size: 21px; letter-spacing: -.04em; text-decoration: none; }
+  .brand span { color: var(--accent); }
+  .pill {
+    font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em;
+    padding: 2px 8px; border-radius: 99px; background: var(--surface-2); color: var(--muted);
+  }
+  .spacer { flex: 1; }
+  .area { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); white-space: nowrap; }
+  .area svg { width: 15px; height: 15px; color: var(--accent); }
+
+  main { max-width: 980px; margin: 0 auto; padding: 28px 20px 80px; }
+  h1 { font-size: 28px; line-height: 1.15; letter-spacing: -.03em; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 22px; }
+
+  .tabs { display: inline-flex; gap: 4px; padding: 4px; background: var(--surface-2); border-radius: 12px; margin-bottom: 14px; }
+  .tab {
+    border: 0; background: transparent; padding: 7px 14px; border-radius: 9px; cursor: pointer;
+    font-weight: 600; color: var(--muted);
+  }
+  .tab[aria-selected="true"] { background: var(--surface); color: var(--text); box-shadow: var(--shadow); }
+  .tab small { font-weight: 500; color: var(--faint); margin-left: 4px; }
+
+  .search {
+    display: flex; flex-wrap: wrap; gap: 10px; align-items: center; padding: 10px;
+    background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow);
+  }
+  .field { flex: 1 1 320px; display: flex; align-items: center; gap: 10px; padding: 0 8px; min-width: 0; }
+  .field svg { width: 18px; height: 18px; color: var(--faint); flex: none; }
+  .field input { flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; font-size: 17px; padding: 8px 0; }
+  .field input::placeholder { color: var(--faint); }
+  .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+  .chip-toggle {
+    display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; border-radius: 99px;
+    border: 1px solid var(--line); font-size: 13px; color: var(--muted); cursor: pointer; user-select: none;
+  }
+  .chip-toggle input { accent-color: var(--accent); margin: 0; }
+  .chip-toggle:has(input:checked) { border-color: var(--accent); color: var(--accent-text); background: var(--accent-soft); }
+  select {
+    border: 1px solid var(--line); background: var(--surface); border-radius: 10px; padding: 6px 8px; font-size: 13px;
+  }
+  .btn {
+    border: 0; border-radius: 10px; padding: 9px 18px; background: var(--accent); color: var(--accent-ink);
+    font-weight: 700; cursor: pointer;
+  }
+  .btn:disabled { opacity: .6; cursor: progress; }
+  [hidden] { display: none !important; }
+
+  .recent { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px 2px 0; min-height: 4px; }
+  .recent button {
+    border: 0; background: var(--surface-2); color: var(--muted); border-radius: 99px; padding: 3px 10px;
+    font-size: 12px; cursor: pointer;
+  }
+  .recent button:hover { color: var(--text); }
+
+  .status { margin: 18px 2px 10px; font-size: 13px; color: var(--muted); min-height: 20px; }
+  .status b { color: var(--text); font-weight: 600; }
+  .notice {
+    margin: 14px 0; padding: 12px 14px; border-radius: 12px; background: var(--danger-soft); color: var(--danger); font-size: 14px;
+  }
+  .notice code { font-size: 12.5px; }
+
+  /* web results */
+  .web-list { display: grid; gap: 10px; }
+  .web-card {
+    display: grid; grid-template-columns: 28px 1fr; gap: 12px; padding: 16px 18px;
+    background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius);
+  }
+  .rank { font-variant-numeric: tabular-nums; color: var(--faint); font-size: 13px; font-weight: 600; padding-top: 2px; }
+  .web-meta { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); min-width: 0; }
+  .avatar {
+    width: 20px; height: 20px; border-radius: 6px; display: grid; place-items: center; flex: none;
+    font-size: 11px; font-weight: 800; color: #fff; text-transform: uppercase;
+  }
+  .domain { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .badge {
+    flex: none; font-size: 11px; font-weight: 700; padding: 1px 8px; border-radius: 99px;
+    background: var(--accent-soft); color: var(--accent-text);
+  }
+  .web-title { display: block; margin: 6px 0 4px; font-size: 17px; font-weight: 650; line-height: 1.3; text-decoration: none; }
+  .web-title:hover { text-decoration: underline; text-underline-offset: 3px; }
+  .snippet {
+    margin: 4px 0 0; color: var(--muted); font-size: 14px;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  }
+  .web-card.open .snippet { -webkit-line-clamp: unset; display: block; }
+  .more-snips { border: 0; background: none; padding: 0; margin-top: 4px; font-size: 12.5px; color: var(--accent-text); cursor: pointer; }
+  .prices { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+  .price {
+    font-variant-numeric: tabular-nums; font-size: 12.5px; font-weight: 700; padding: 2px 8px; border-radius: 8px;
+    background: var(--surface-2); color: var(--text);
+  }
+
+  /* listings */
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 14px; }
+  .listing {
+    display: flex; flex-direction: column; background: var(--surface); border: 1px solid var(--line);
+    border-radius: var(--radius); overflow: hidden; text-decoration: none; transition: transform .12s, box-shadow .12s;
+  }
+  .listing:hover { transform: translateY(-2px); box-shadow: var(--shadow); }
+  .thumb { aspect-ratio: 1 / 1; background: var(--surface-2); display: block; width: 100%; object-fit: cover; }
+  .listing-body { padding: 10px 12px 12px; display: grid; gap: 2px; }
+  .listing-price { font-size: 17px; font-weight: 800; font-variant-numeric: tabular-nums; }
+  .listing-price s { font-size: 13px; font-weight: 500; color: var(--faint); margin-left: 6px; }
+  .listing-title { font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .listing-meta { font-size: 12.5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tag { font-size: 11px; font-weight: 700; color: var(--ok); }
+  .tag.pending { color: var(--accent-text); }
+
+  /* sniper */
+  .live { display: inline-flex; align-items: center; gap: 8px; }
+  .pulse { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 0 0 var(--ok); animation: pulse 2s infinite; }
+  @keyframes pulse { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--ok) 60%, transparent); } 100% { box-shadow: 0 0 0 10px transparent; } }
+  .section-title { font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 26px 2px 10px; }
+  .alerts { display: grid; gap: 10px; }
+  .alert-card {
+    display: grid; grid-template-columns: 92px 1fr; gap: 14px; padding: 10px; text-decoration: none;
+    background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius);
+  }
+  .alert-card .thumb { width: 92px; height: 92px; border-radius: 10px; }
+  .alert-title { font-weight: 650; font-size: 16px; line-height: 1.3; }
+  .row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; font-size: 13px; color: var(--muted); margin-top: 4px; }
+  .age { font-weight: 700; font-size: 12px; padding: 1px 8px; border-radius: 99px; background: var(--surface-2); color: var(--muted); }
+  .age.fresh { background: var(--accent); color: var(--accent-ink); }
+  .watch-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 10px; margin: 26px 2px 10px; }
+  .watch-head h3 { margin: 0; font-size: 17px; }
+  .watch-head span { font-size: 13px; color: var(--muted); }
+  .listing.dim { opacity: .5; }
+  .why { font-size: 11.5px; color: var(--danger); }
+  @media (prefers-reduced-motion: reduce) { .pulse { animation: none; } }
+
+  .load-more {
+    display: block; margin: 20px auto 0; border: 1px solid var(--line); background: var(--surface);
+    padding: 9px 18px; border-radius: 10px; cursor: pointer; font-weight: 600;
+  }
+
+  /* states */
+  .empty { text-align: center; padding: 48px 16px; color: var(--muted); }
+  .empty h2 { color: var(--text); font-size: 18px; margin: 0 0 6px; }
+  .examples { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-top: 14px; }
+  .examples button {
+    border: 1px solid var(--line); background: var(--surface); border-radius: 99px; padding: 6px 12px; cursor: pointer;
+  }
+  .skeleton {
+    height: 108px; border-radius: var(--radius); background: linear-gradient(90deg, var(--surface) 0%, var(--surface-2) 50%, var(--surface) 100%);
+    background-size: 200% 100%; animation: shimmer 1.2s infinite linear; border: 1px solid var(--line);
+  }
+  .grid .skeleton { height: 280px; }
+  @keyframes shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+  @media (prefers-reduced-motion: reduce) { .skeleton { animation: none; } .listing { transition: none; } }
+
+  @media (max-width: 640px) {
+    .top { padding: 10px 16px; }
+    .area span { display: none; }
+    main { padding: 20px 16px 64px; }
+    h1 { font-size: 23px; }
+    .controls { width: 100%; }
+    .btn { margin-left: auto; }
+    .web-card { grid-template-columns: 1fr; padding: 14px; }
+    .rank { display: none; }
+    .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+  }
+</style>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="/ui">swipr<span>.</span></a>
+  <span class="pill">local</span>
+  <span class="spacer"></span>
+  <span class="area" title="Default search area">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 21s-7-6.1-7-11.5A7 7 0 0 1 19 9.5C19 14.9 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.5"/></svg>
+    <span id="area-label">Downtown San Diego · 40 mi</span>
+  </span>
+</header>
+
+<main>
+  <h1>Find it nearby</h1>
+  <p class="sub" id="sub">Live web results, ranked for the US and focused on San Diego.</p>
+
+  <div class="tabs" role="tablist" aria-label="Result source">
+    <button class="tab" role="tab" data-tab="sniper" aria-selected="false" hidden>Sniper <small>live</small></button>
+    <button class="tab" role="tab" data-tab="web" aria-selected="true">Web <small>Oxylabs</small></button>
+    <button class="tab" role="tab" data-tab="listings" aria-selected="false">Listings <small>swipr index</small></button>
+  </div>
+
+  <form class="search" id="search-form" role="search">
+    <label class="field">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+      <input id="q" name="q" type="search" placeholder="What are you looking for?" autocomplete="off" maxlength="200" aria-label="Search">
+    </label>
+    <div class="controls">
+      <label class="chip-toggle" data-only="web"><input type="checkbox" id="near" checked> Near San Diego</label>
+      <label class="chip-toggle" data-only="web"><input type="checkbox" id="mk"> Marketplaces only</label>
+      <select id="count" data-only="web" aria-label="Number of results">
+        <option value="5">5 results</option>
+        <option value="10" selected>10 results</option>
+        <option value="20">20 results</option>
+      </select>
+      <select id="sort" data-only="listings" aria-label="Sort listings" hidden>
+        <option value="newest">Newest</option>
+        <option value="relevance">Best match</option>
+        <option value="price_asc">Price: low to high</option>
+        <option value="price_desc">Price: high to low</option>
+        <option value="distance">Nearest</option>
+      </select>
+      <button class="btn" id="go" type="submit">Search</button>
+    </div>
+  </form>
+  <div class="recent" id="recent" aria-label="Recent searches"></div>
+
+  <div id="notice"></div>
+  <p class="status" id="status" aria-live="polite"></p>
+  <section id="results"></section>
+  <button class="load-more" id="more" type="button" hidden>Load more</button>
+</main>
+
+<script>
+(() => {
+  const $ = (s) => document.querySelector(s);
+  const KM_PER_MI = 1.609344;
+  const EXAMPLES = { web: ['used couch', 'road bike', 'standing desk', 'PS5'], listings: ['couch', 'bike', 'desk', ''] };
+  const state = { tab: 'web', area: null, webEnabled: true, cursor: null, last: null, busy: false, sniper: null, sniperTimer: null };
+
+  // ── helpers ──
+  const el = (tag, cls, text) => {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text !== undefined && text !== null) n.textContent = text;
+    return n;
+  };
+  const safeHref = (u) => {
+    try { const x = new URL(u, location.origin); return /^https?:$/.test(x.protocol) ? x.href : '#'; } catch { return '#'; }
+  };
+  const hue = (s) => { let h = 0; for (const c of s) h = (h * 31 + c.charCodeAt(0)) >>> 0; return h % 360; };
+  const money = (cents) => (cents === 0 ? 'Free' : '$' + (cents / 100).toLocaleString('en-US', { maximumFractionDigits: 0 }));
+  const ago = (iso) => {
+    const s = (Date.now() - new Date(iso).getTime()) / 1000;
+    if (s < 60) return 'just now';
+    if (s < 3600) return Math.round(s / 60) + 'm ago';
+    if (s < 86400) return Math.round(s / 3600) + 'h ago';
+    return Math.round(s / 86400) + 'd ago';
+  };
+  const store = {
+    get(k, d) { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } },
+    set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* storage unavailable */ } },
+  };
+  const radiusMi = () => (state.area ? Math.round(state.area.radiusKm / KM_PER_MI) : 40);
+  const areaName = () => (state.area?.city ?? 'San Diego');
+
+  async function api(path) {
+    const res = await fetch(path, { headers: { accept: 'application/json' } });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw Object.assign(new Error(body.message || `HTTP ${res.status}`), { status: res.status });
+    return body;
+  }
+
+  // ── chrome: tabs, recent searches, URL state ──
+  function setTab(tab, { keepResults = false } = {}) {
+    state.tab = tab;
+    document.querySelectorAll('.tab').forEach((b) => b.setAttribute('aria-selected', String(b.dataset.tab === tab)));
+    document.querySelectorAll('[data-only]').forEach((n) => (n.hidden = n.dataset.only !== tab));
+    $('#search-form').hidden = tab === 'sniper';
+    $('#recent').hidden = tab === 'sniper';
+    clearInterval(state.sniperTimer);
+    if (tab === 'sniper') {
+      $('#sub').textContent = `New Facebook Marketplace listings within ${radiusMi()} miles of Downtown ${areaName()}, as they're posted.`;
+      $('#more').hidden = true;
+      $('#notice').replaceChildren();
+      syncUrl('');
+      loadSniper();
+      state.sniperTimer = setInterval(loadSniper, 20_000);
+      return;
+    }
+    $('#sub').textContent = tab === 'web'
+      ? `Live web results, ranked for the US and focused on ${areaName()}.`
+      : `Listings swipr has collected within ${radiusMi()} miles of Downtown ${areaName()}.`;
+    $('#q').placeholder = tab === 'web' ? 'What are you looking for?' : 'Filter listings (leave empty to browse)';
+    renderRecent();
+    if (!keepResults) { $('#results').replaceChildren(); $('#status').textContent = ''; $('#more').hidden = true; $('#notice').replaceChildren(); showEmpty(); }
+  }
+
+  function renderRecent() {
+    const box = $('#recent');
+    box.replaceChildren();
+    for (const q of store.get(`swipr.recent.${state.tab}`, [])) {
+      const b = el('button', '', q || '(all listings)');
+      b.type = 'button';
+      b.onclick = () => { $('#q').value = q; run(); };
+      box.append(b);
+    }
+  }
+  function remember(q) {
+    const key = `swipr.recent.${state.tab}`;
+    store.set(key, [q, ...store.get(key, []).filter((x) => x !== q)].slice(0, 6));
+    renderRecent();
+  }
+  function syncUrl(q) {
+    const u = new URL(location.href);
+    u.searchParams.set('tab', state.tab);
+    q ? u.searchParams.set('q', q) : u.searchParams.delete('q');
+    history.replaceState(null, '', u);
+  }
+
+  function showEmpty() {
+    const box = el('div', 'empty');
+    box.append(el('h2', '', state.tab === 'web' ? 'Search the web around ' + areaName() : 'Browse swipr listings'));
+    box.append(el('p', '', state.tab === 'web'
+      ? 'Results come live from Oxylabs. Marketplace pages are tagged, and prices in snippets are pulled out.'
+      : `Everything the crawler has stored within ${radiusMi()} miles, newest first.`));
+    const ex = el('div', 'examples');
+    for (const q of EXAMPLES[state.tab]) {
+      const b = el('button', '', q || 'Everything');
+      b.type = 'button';
+      b.onclick = () => { $('#q').value = q; run(); };
+      ex.append(b);
+    }
+    box.append(ex);
+    $('#results').replaceChildren(box);
+  }
+
+  function showLoading(n, grid) {
+    const wrap = el('div', grid ? 'grid' : 'web-list');
+    for (let i = 0; i < n; i++) wrap.append(el('div', 'skeleton'));
+    $('#results').replaceChildren(wrap);
+  }
+
+  function showError(err) {
+    const box = el('div', 'notice');
+    box.append(el('strong', '', 'Search failed. '), document.createTextNode(err.message));
+    if (err.status === 503) {
+      box.append(el('br'), document.createTextNode('Start the API with '));
+      box.append(el('code', '', 'OXYLABS_WEB_API_KEY'), document.createTextNode(' set, then reload.'));
+    }
+    $('#notice').replaceChildren(box);
+    $('#results').replaceChildren();
+    $('#status').textContent = '';
+  }
+
+  // ── web (Oxylabs) ──
+  function webCard(r) {
+    const card = el('article', 'web-card');
+    card.append(el('div', 'rank', String(r.position)));
+    const body = el('div');
+    const meta = el('div', 'web-meta');
+    const av = el('span', 'avatar', r.domain.replace(/^www\./, '').charAt(0));
+    av.style.background = `hsl(${hue(r.domain)} 55% 45%)`;
+    meta.append(av, el('span', 'domain', r.domain));
+    if (r.marketplace) meta.append(el('span', 'badge', r.marketplace));
+    const title = el('a', 'web-title', r.title);
+    title.href = safeHref(r.url);
+    title.target = '_blank';
+    title.rel = 'noopener noreferrer';
+    body.append(meta, title);
+    const snips = r.outline.slice(0, 3);
+    for (const s of snips) body.append(el('p', 'snippet', s));
+    if (snips.join(' ').length > 220) {
+      const more = el('button', 'more-snips', 'Show more');
+      more.type = 'button';
+      more.onclick = () => { card.classList.toggle('open'); more.textContent = card.classList.contains('open') ? 'Show less' : 'Show more'; };
+      body.append(more);
+    }
+    if (r.prices.length) {
+      const prices = el('div', 'prices');
+      for (const p of r.prices) prices.append(el('span', 'price', p === '$0' ? 'Free' : p));
+      body.append(prices);
+    }
+    card.append(body);
+    return card;
+  }
+
+  function renderWeb() {
+    const data = state.last;
+    if (!data) return;
+    const onlyMk = $('#mk').checked;
+    const rows = onlyMk ? data.results.filter((r) => r.marketplace) : data.results;
+    const status = $('#status');
+    status.replaceChildren(
+      el('b', '', `${rows.length} result${rows.length === 1 ? '' : 's'}`),
+      document.createTextNode(onlyMk ? ` of ${data.results.length} are marketplace pages` : ''),
+      document.createTextNode(` · ${data.cached ? 'from cache' : (data.ms / 1000).toFixed(1) + ' s'} · “${data.query}” · ${data.location ?? 'global'}`),
+    );
+    if (!rows.length) {
+      const box = el('div', 'empty');
+      box.append(el('h2', '', onlyMk ? 'No marketplace pages in these results' : 'No results'),
+        el('p', '', onlyMk ? 'Turn off “Marketplaces only”, or try a broader search.' : 'Try different words.'));
+      $('#results').replaceChildren(box);
+      return;
+    }
+    const list = el('div', 'web-list');
+    rows.forEach((r) => list.append(webCard(r)));
+    $('#results').replaceChildren(list);
+  }
+
+  async function searchWeb(q) {
+    if (!q) { $('#q').focus(); return; }
+    const near = $('#near').checked && !q.toLowerCase().includes(areaName().toLowerCase());
+    const query = near ? `${q} ${areaName()} ${state.area?.region ?? 'CA'}` : q;
+    const params = new URLSearchParams({ q: query, max: $('#count').value, location: state.area?.country ?? 'US' });
+    showLoading(Math.min(Number($('#count').value), 5), false);
+    $('#status').textContent = 'Searching…';
+    state.last = await api('/web-search?' + params);
+    renderWeb();
+  }
+
+  // ── listings (swipr index) ──
+  function listingCard(it) {
+    const a = el('a', 'listing');
+    a.href = safeHref(it.url);
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+    const img = el('img', 'thumb');
+    img.alt = '';
+    img.loading = 'lazy';
+    if (it.image) img.src = safeHref(it.image);
+    img.onerror = () => img.removeAttribute('src');
+    const body = el('div', 'listing-body');
+    const price = el('div', 'listing-price', money(Math.round(it.price * 100)));
+    body.append(price, el('div', 'listing-title', it.title));
+    // 'area' = the source gave only a city, so the listing sits at the search centre: a distance would be made up.
+    const distance = it.geo_precision === 'area' ? 'approx. location'
+      : it.distance_km !== undefined ? `${(it.distance_km / KM_PER_MI).toFixed(1)} mi` : null;
+    body.append(el('div', 'listing-meta', [it.city, distance, ago(it.posted_at)].filter(Boolean).join(' · ')));
+    a.append(img, body);
+    return a;
+  }
+
+  async function searchListings(q, append) {
+    const a = state.area;
+    const params = new URLSearchParams({ sort: $('#sort').value, limit: '24' });
+    if (q) params.set('q', q);
+    if (a) { params.set('lat', a.lat); params.set('lng', a.lng); params.set('radius_km', a.radiusKm); }
+    if (append && state.cursor) params.set('cursor', state.cursor);
+    if (!append) { showLoading(8, true); $('#status').textContent = 'Searching…'; }
+    const data = await api('/search?' + params);
+    state.cursor = data.next_cursor;
+    let grid = $('#results .grid');
+    if (!append || !grid) { grid = el('div', 'grid'); $('#results').replaceChildren(grid); }
+    data.items.forEach((it) => grid.append(listingCard(it)));
+    const shown = grid.children.length;
+    if (!shown) {
+      const box = el('div', 'empty');
+      box.append(el('h2', '', 'No listings yet'), el('p', '', 'The crawler may still be warming up. Try again in a few seconds.'));
+      $('#results').replaceChildren(box);
+    }
+    $('#status').replaceChildren(
+      el('b', '', `${data.total ?? shown} listing${(data.total ?? shown) === 1 ? '' : 's'}`),
+      document.createTextNode(` within ${radiusMi()} mi of Downtown ${areaName()}${q ? ` · “${q}”` : ''}`),
+    );
+    $('#more').hidden = !state.cursor;
+  }
+
+  // ── sniper (live) ──
+  const minutesAgo = (iso) => (iso ? (Date.now() - new Date(iso).getTime()) / 60000 : null);
+  function ageBadge(iso) {
+    const m = minutesAgo(iso);
+    if (m === null) return el('span', 'age', 'time unknown');
+    const label = m < 1 ? 'just now' : m < 60 ? `${Math.floor(m)} min ago` : m < 1440 ? `${Math.floor(m / 60)} h ago` : `${Math.floor(m / 1440)} d ago`;
+    return el('span', 'age' + (m <= 10 ? ' fresh' : ''), label);
+  }
+  function thumb(src) {
+    const img = el('img', 'thumb');
+    img.alt = '';
+    img.loading = 'lazy';
+    img.referrerPolicy = 'no-referrer';
+    if (src) img.src = safeHref(src);
+    img.onerror = () => img.removeAttribute('src');
+    return img;
+  }
+  const place = (city, region, mi) => [city && region ? `${city}, ${region}` : city, mi !== null && mi !== undefined ? `${Math.round(mi)} mi` : null].filter(Boolean).join(' · ');
+
+  function alertCard(a) {
+    const card = el('a', 'alert-card');
+    card.href = safeHref(a.url);
+    card.target = '_blank';
+    card.rel = 'noopener noreferrer';
+    const body = el('div');
+    body.append(el('div', 'listing-price', money(a.priceCents)), el('div', 'alert-title', a.title));
+    const row = el('div', 'row');
+    row.append(ageBadge(a.postedAt), document.createTextNode(place(a.city, a.region, a.distanceMi)), el('span', 'badge', a.watchId));
+    body.append(row);
+    card.append(thumb(a.imageUrl), body);
+    return card;
+  }
+
+  function sniperListing(l) {
+    const a = el('a', 'listing' + (l.match ? '' : ' dim'));
+    a.href = safeHref(l.url);
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+    const body = el('div', 'listing-body');
+    body.append(el('div', 'listing-price', money(l.priceCents)), el('div', 'listing-title', l.title));
+    const row = el('div', 'row');
+    row.append(ageBadge(l.postedAt), document.createTextNode(place(l.city, null, l.distanceMi)));
+    body.append(row);
+    if (!l.match) body.append(el('div', 'why', `won't alert: ${l.reason}`));
+    a.append(thumb(l.image), body);
+    return a;
+  }
+
+  function renderSniper() {
+    const d = state.sniper;
+    if (!d || state.tab !== 'sniper') return;
+    const out = [];
+    out.push(el('div', 'section-title', 'Alerts'));
+    if (!d.alerts.length) {
+      const box = el('div', 'empty');
+      box.append(el('h2', '', 'No alerts yet'),
+        el('p', '', 'A listing shows up here (and on your phone, if ntfy is set up) the moment a watch sees one that matches.'));
+      out.push(box);
+    } else {
+      const list = el('div', 'alerts');
+      d.alerts.slice(0, 20).forEach((x) => list.append(alertCard(x)));
+      out.push(list);
+    }
+    for (const w of d.watches) {
+      const head = el('div', 'watch-head');
+      const rules = [w.maxPrice !== undefined ? `≤ $${w.maxPrice}` : null, w.include?.length ? `must say “${w.include.join('”, “')}”` : null,
+        `every ${Math.round(w.everySec / 60)} min`, `alerts if posted in the last ${w.maxAgeMin} min`].filter(Boolean).join(' · ');
+      head.append(el('h3', '', `“${w.query}”`), el('span', '', rules));
+      out.push(head);
+      if (!w.listings.length) { out.push(el('p', 'sub', 'Nothing seen yet; the first check runs within a couple of minutes.')); continue; }
+      const grid = el('div', 'grid');
+      w.listings.forEach((l) => grid.append(sniperListing(l)));
+      out.push(grid);
+    }
+    $('#results').replaceChildren(...out);
+    const fresh = d.watches.flatMap((w) => w.listings).filter((l) => (minutesAgo(l.postedAt) ?? 99) <= 10).length;
+    const status = $('#status');
+    const live = el('span', 'live');
+    live.append(el('span', 'pulse'), el('b', '', `Live · ${d.watches.length} watch${d.watches.length === 1 ? '' : 'es'}`));
+    status.replaceChildren(live, document.createTextNode(` · ${d.alerts.length} alert${d.alerts.length === 1 ? '' : 's'} · ${fresh} listing${fresh === 1 ? '' : 's'} posted in the last 10 min · refreshes every 20 s`));
+  }
+
+  async function loadSniper() {
+    try {
+      state.sniper = await api('/sniper?per=8');
+      renderSniper();
+    } catch (err) {
+      showError(err);
+    }
+  }
+
+  // ── run ──
+  async function run(append = false) {
+    if (state.busy) return;
+    const q = $('#q').value.trim();
+    state.busy = true;
+    $('#go').disabled = true;
+    $('#notice').replaceChildren();
+    try {
+      if (state.tab === 'web') {
+        if (!state.webEnabled) throw Object.assign(new Error('Web search is not configured on this API.'), { status: 503 });
+        await searchWeb(q);
+      } else {
+        await searchListings(q, append);
+      }
+      if (!append && (q || state.tab === 'listings')) { remember(q); syncUrl(q); }
+    } catch (err) {
+      showError(err);
+    } finally {
+      state.busy = false;
+      $('#go').disabled = false;
+    }
+  }
+
+  $('#search-form').addEventListener('submit', (e) => { e.preventDefault(); run(); });
+  $('#more').addEventListener('click', () => run(true));
+  $('#mk').addEventListener('change', () => state.last && renderWeb());
+  $('#sort').addEventListener('change', () => state.tab === 'listings' && run());
+  document.querySelectorAll('.tab').forEach((b) => b.addEventListener('click', () => { if (b.dataset.tab !== state.tab) setTab(b.dataset.tab); }));
+  document.addEventListener('keydown', (e) => {
+    if (e.key === '/' && document.activeElement !== $('#q')) { e.preventDefault(); $('#q').focus(); }
+  });
+
+  // ── boot ──
+  (async () => {
+    try {
+      const meta = await api('/meta');
+      state.area = meta.areas?.[0] ?? null;
+      state.webEnabled = !!meta.webSearch;
+      $('#area-label').textContent = `Downtown ${areaName()} · ${radiusMi()} mi`;
+      document.querySelector('label[data-only="web"]').lastChild.textContent = ` Near ${areaName()}`;
+    } catch { /* keep defaults */ }
+    const params = new URLSearchParams(location.search);
+    let sniperOn = false;
+    try { sniperOn = (await api('/sniper?per=1')).enabled; } catch { /* no sniper */ }
+    document.querySelector('.tab[data-tab="sniper"]').hidden = !sniperOn;
+    const wanted = params.get('tab');
+    setTab(['listings', 'web', 'sniper'].includes(wanted) && (wanted !== 'sniper' || sniperOn) ? wanted : sniperOn ? 'sniper' : 'web');
+    setInterval(() => state.tab === 'sniper' && renderSniper(), 15_000);   // keep "N min ago" current between refreshes
+    if (!state.webEnabled && state.tab === 'web') {
+      showError(Object.assign(new Error('Web search is not configured on this API.'), { status: 503 }));
+    }
+    const q = params.get('q');
+    if (q !== null) { $('#q').value = q; run(); }
+  })();
+})();
+</script>
+</body>
+</html>

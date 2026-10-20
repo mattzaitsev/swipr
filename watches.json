@@ -1,0 +1,28 @@
+{
+  "area": {
+    "label": "san-diego",
+    "city": "San Diego",
+    "region": "CA",
+    "country": "US",
+    "lat": 32.7157,
+    "lng": -117.1611,
+    "radiusMi": 40,
+    "states": ["CA"],
+    "facebookLocation": "sandiego"
+  },
+  "defaults": {
+    "sources": ["facebook"],
+    "everySec": 120,
+    "maxAgeMin": 120,
+    "minPrice": 1000,
+    "exclude": [
+      "parts", "part out", "parting out", "rims", "wheels", "tires", "bumper", "headlight", "tail light", "taillight",
+      "mirror", "seat cover", "floor mats", "transmission", "catalytic", "radio", "stereo", "key fob", "fender", "grille"
+    ]
+  },
+  "watches": [
+    { "id": "honda", "query": "honda", "include": ["honda"] },
+    { "id": "toyota", "query": "toyota", "include": ["toyota"] },
+    { "id": "nissan", "query": "nissan", "include": ["nissan"] }
+  ]
+}

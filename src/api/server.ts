@@ -1,12 +1,17 @@
 /**
- * Public API: search (Typesense), listing detail (Postgres), saved searches + their hits (Postgres).
+ * Public API: search (Typesense), listing detail (Postgres), saved searches + their hits (Postgres),
+ * live web search (Oxylabs, server-side key) and the local UI at /ui.
  */
+import { readFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
 import Fastify, { type FastifyRequest } from 'fastify';
 import { config } from '../config';
 import { pool } from '../db';
 import { isMain, logger, runMain } from '../runtime';
 import { buildSearch, distanceKm, nextCursor, type SearchInput } from '../search/query';
 import { searchDocs, typesenseHealthy } from '../search/typesense';
+import { webSearch, webSearchConfigured } from '../integrations/oxylabs';
+import { registerSniperRoutes } from './sniper-routes';
 
 const log = logger('api');
 const CONDITIONS = ['new', 'used', 'refurbished', 'unknown'];
@@ -23,6 +28,16 @@ function userId(req: FastifyRequest): string {
 }
 
 const httpError = (statusCode: number, message: string) => Object.assign(new Error(message), { statusCode });
+const UI_FILE = fileURLToPath(new URL('../../web/index.html', import.meta.url));
+
+/** Every upstream web search spends Oxylabs credits: a simple per-process budget guards against runaway loops. */
+const WEB_SEARCH_PER_MINUTE = 30;
+let webSearchWindow = { start: 0, count: 0 };
+function takeWebSearchSlot() {
+  const now = Date.now();
+  if (now - webSearchWindow.start > 60_000) webSearchWindow = { start: now, count: 0 };
+  if (++webSearchWindow.count > WEB_SEARCH_PER_MINUTE) throw httpError(429, `web search limited to ${WEB_SEARCH_PER_MINUTE}/min locally`);
+}
 
 /**
  * Primary image per listing, read fresh from Postgres: Marketplace image URLs are signed and expire, so they are
@@ -41,6 +56,39 @@ async function primaryImages(ids: number[]): Promise<Map<number, string>> {
 
 export function buildApp() {
   const app = Fastify({ logger: false });
+
+  // ── Local UI (single file, read per request so edits show on reload) ──
+  app.get('/', async (_req, reply) => reply.redirect('/ui'));
+  app.get('/ui', async (_req, reply) => reply.type('text/html; charset=utf-8').send(await readFile(UI_FILE, 'utf8')));
+
+  // Personal deal sniper: latest alerts + each watch's newest listings (UI "Sniper" tab).
+  registerSniperRoutes(app);
+
+  // What the UI needs to know: search areas (search.config.json) and whether web search is configured.
+  app.get('/meta', async () => ({ areas: config.search.areas, webSearch: webSearchConfigured() }));
+
+  // ── Live web search through Oxylabs. The key stays on the server; results are cached for 10 minutes. ──
+  app.get<{ Querystring: { q: string; max: number; location: string } }>(
+    '/web-search',
+    {
+      schema: {
+        querystring: {
+          type: 'object',
+          required: ['q'],
+          additionalProperties: false,
+          properties: {
+            q: { type: 'string', minLength: 1, maxLength: 2048 },
+            max: { type: 'integer', minimum: 1, maximum: 20, default: 10 },
+            location: { type: 'string', pattern: '^[A-Za-z]{2}$', default: 'US' },
+          },
+        },
+      },
+    },
+    async (req) => {
+      takeWebSearchSlot();
+      return webSearch({ query: req.query.q, maxResults: req.query.max, location: req.query.location });
+    },
+  );
 
   app.get('/health', async () => {
     const pg = await pool.query('select 1').then(() => true, () => false);

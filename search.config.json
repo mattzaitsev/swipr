@@ -1,8 +1,6 @@
 {
   "queries": ["couch", "bike", "desk"],
   "areas": [
-    { "label": "austin", "lat": 30.2672, "lng": -97.7431, "radiusKm": 30, "country": "US", "region": "TX", "city": "Austin" },
-    { "label": "phoenix", "lat": 33.4484, "lng": -112.074, "radiusKm": 30, "country": "US", "region": "AZ", "city": "Phoenix" },
-    { "label": "seattle", "lat": 47.6062, "lng": -122.3321, "radiusKm": 30, "country": "US", "region": "WA", "city": "Seattle" }
+    { "label": "san-diego", "lat": 32.7157, "lng": -117.1611, "radiusKm": 64.4, "country": "US", "region": "CA", "city": "San Diego" }
   ]
 }
